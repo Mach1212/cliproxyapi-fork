@@ -1,0 +1,259 @@
+{{- /*
+The pod:
+- cliproxyapi: the proxy, on 127.0.0.1 only. Its management API answers there to the
+  management key, and the gate lets none of its paths through. With the pool on, the site
+  API listens on a port of its own, for the website alone.
+- gate: HAProxy, the only listener clients reach. HTTP/1 only; lets only /v1/ and /v1beta/
+  paths through after normalization; refuses any %-encoding; strips forwarded headers. Its
+  runtime API on 127.0.0.1:9999 drains it.
+- config-init, config-sync: copy the configuration out of the Secret into memory and keep
+  the copy current by writing the file in place. The proxy misses the swap of a mounted
+  Secret, but reloads on a write in place (about 60 to 90 s after the Secret changes).
+- keeper: follows the fork's releases. The only container with a token for the cluster.
+*/ -}}
+{{- $name := include "cliproxyapi.fullname" . -}}
+{{- if and .Values.pool.enabled (not .Values.pool.siteKey.existingSecret) }}
+{{- fail "pool.siteKey.existingSecret is required with the pool: the Secret that holds the site API's key" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "cliproxyapi.selector" . | nindent 6 }}
+  # One disk, and maybe a port of the node: the old pod has to be gone before the new one starts.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "cliproxyapi.selector" . | nindent 8 }}
+    spec:
+      {{- if .Values.keeper.enabled }}
+      serviceAccountName: {{ $name }}-keeper
+      {{- end }}
+      # Only the keeper container gets a token (projected below).
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: config-init
+          image: {{ .Values.haproxyImage }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "cat /etc/cliproxy-src/config.yaml > /etc/cliproxy/config.yaml"]
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {memory: 32Mi}
+          securityContext:
+            {{- include "cliproxyapi.restricted" . | nindent 12 }}
+          volumeMounts:
+            - {name: config-src, mountPath: /etc/cliproxy-src, readOnly: true}
+            - {name: config, mountPath: /etc/cliproxy}
+      containers:
+        - name: cliproxyapi
+          image: {{ include "cliproxyapi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["./CLIProxyAPI", "-config", "/etc/cliproxy/config.yaml"]
+          env:
+            - name: TZ
+              value: {{ .Values.proxy.timezone | quote }}
+            {{- if .Values.pool.enabled }}
+            - name: POOL_STATE_DIR
+              value: /var/lib/cliproxy-pool
+            - name: POOL_LISTEN
+              value: ":{{ .Values.pool.service.port }}"
+            - name: POOL_SITE_KEY_FILE
+              value: /etc/cliproxy-pool/site-key
+            - name: POOL_MANAGEMENT_URL
+              value: "http://127.0.0.1:{{ .Values.proxy.port }}/v8/management"
+            - name: POOL_MANAGEMENT_KEY_FILE
+              value: /etc/cliproxy-management/management-key
+            {{- end }}
+          {{- if .Values.pool.enabled }}
+          ports:
+            - name: site-api
+              containerPort: {{ .Values.pool.service.port }}
+              protocol: TCP
+          {{- end }}
+          # On the proxy's own port, not on the gate, so a drain does not make the pod
+          # NotReady while long answers finish.
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/{{ .Values.proxy.port }}"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+          # Root, because the account files on the disk are root's. No capabilities.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/cliproxy, readOnly: true}
+            - {name: auth, mountPath: /root/.cli-proxy-api}
+            {{- if .Values.pool.enabled }}
+            - {name: pool, mountPath: /var/lib/cliproxy-pool}
+            - {name: site-key, mountPath: /etc/cliproxy-pool, readOnly: true}
+            - {name: management-key, mountPath: /etc/cliproxy-management, readOnly: true}
+            {{- end }}
+        - name: gate
+          image: {{ .Values.haproxyImage }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: api
+              containerPort: {{ .Values.gate.port }}
+              {{- if .Values.gate.hostPort }}
+              hostPort: {{ .Values.gate.hostPort }}
+              {{- end }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.gate.resources | nindent 12 }}
+          securityContext:
+            {{- include "cliproxyapi.restricted" . | nindent 12 }}
+          volumeMounts:
+            - {name: gate, mountPath: /usr/local/etc/haproxy, readOnly: true}
+        - name: config-sync
+          image: {{ .Values.haproxyImage }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              # The haproxy image's stop signal is SIGUSR1.
+              trap 'exit 0' TERM INT USR1
+              while :; do
+                if ! cmp -s /etc/cliproxy-src/config.yaml /etc/cliproxy/config.yaml; then
+                  cat /etc/cliproxy-src/config.yaml > /etc/cliproxy/config.yaml &&
+                    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) config-sync: config.yaml updated"
+                fi
+                sleep 5 & wait $!
+              done
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {memory: 32Mi}
+          securityContext:
+            {{- include "cliproxyapi.restricted" . | nindent 12 }}
+          volumeMounts:
+            - {name: config-src, mountPath: /etc/cliproxy-src, readOnly: true}
+            - {name: config, mountPath: /etc/cliproxy}
+        {{- if .Values.keeper.enabled }}
+        - name: keeper
+          image: {{ .Values.keeper.image }}
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/opt/keeper/keeper.sh"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            - name: HOME
+              value: /tmp
+            - name: KEEPER_DEPLOYMENT
+              value: {{ $name }}
+            - name: KEEPER_REPOSITORY
+              value: {{ .Values.image.repository }}
+            - name: KEEPER_RELEASE_URL
+              value: https://api.github.com/repos/{{ .Values.keeper.githubRepository }}/releases/latest
+            - name: KEEPER_HEALTH_URL
+              value: http://127.0.0.1:{{ .Values.gate.port }}/v1/models
+          resources:
+            {{- toYaml .Values.keeper.resources | nindent 12 }}
+          # Group 0 reads the projected token (root:root 0440).
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 0
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: keeper, mountPath: /opt/keeper, readOnly: true}
+            - {name: keeper-state, mountPath: /run/keeper}
+            - {name: keeper-tmp, mountPath: /tmp}
+            - {name: kube-api, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
+        {{- end }}
+      volumes:
+        - name: config-src
+          secret:
+            secretName: {{ .Values.config.existingSecret }}
+            defaultMode: 0444
+            items:
+              - {key: {{ .Values.config.key }}, path: config.yaml}
+        - name: config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: auth
+          persistentVolumeClaim:
+            claimName: {{ .Values.auth.existingClaim | default (printf "%s-auth" $name) }}
+        - name: gate
+          configMap:
+            name: {{ $name }}-gate
+        {{- if .Values.pool.enabled }}
+        - name: pool
+          persistentVolumeClaim:
+            claimName: {{ .Values.pool.storage.existingClaim | default (printf "%s-pool" $name) }}
+        - name: site-key
+          secret:
+            secretName: {{ .Values.pool.siteKey.existingSecret }}
+            defaultMode: 0400
+            items:
+              - {key: {{ .Values.pool.siteKey.key }}, path: site-key}
+        # Only the management key of the Secret, not the configuration with the client keys.
+        - name: management-key
+          secret:
+            secretName: {{ .Values.config.existingSecret }}
+            defaultMode: 0400
+            items:
+              - {key: {{ .Values.config.managementKey }}, path: management-key}
+        {{- end }}
+        {{- if .Values.keeper.enabled }}
+        - name: keeper
+          configMap:
+            name: {{ $name }}-keeper
+        - name: keeper-state
+          emptyDir:
+            sizeLimit: 1Mi
+        - name: keeper-tmp
+          emptyDir:
+            sizeLimit: 32Mi
+        - name: kube-api
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - {key: ca.crt, path: ca.crt}
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef: {fieldPath: metadata.namespace}
+        {{- end }}

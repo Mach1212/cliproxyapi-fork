@@ -1,0 +1,62 @@
+{{- $name := include "cliproxyapi.fullname" . -}}
+{{- if .Values.pool.enabled }}
+# The site API, for the website.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-pool
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "cliproxyapi.selector" . | nindent 4 }}
+  ports:
+    - name: site-api
+      port: {{ .Values.pool.service.port }}
+      targetPort: site-api
+---
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+# Who may connect to the pod. A client that reaches the gate through the node's port
+# arrives with its own address when it is on the node's network, and with its node's
+# address when it is a pod of another node.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-ingress
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cliproxyapi.selector" . | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    {{- with .Values.networkPolicy.clientCIDRs }}
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.gate.port }}
+    {{- end }}
+    {{- if and .Values.pool.enabled .Values.networkPolicy.siteFrom }}
+    - from:
+        {{- range .Values.networkPolicy.siteFrom }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.pool.service.port }}
+    {{- end }}
+    {{- if not (or .Values.networkPolicy.clientCIDRs (and .Values.pool.enabled .Values.networkPolicy.siteFrom)) }}
+    []
+    {{- end }}
+{{- end }}

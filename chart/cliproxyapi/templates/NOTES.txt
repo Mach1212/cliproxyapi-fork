@@ -1,0 +1,12 @@
+The proxy runs {{ include "cliproxyapi.image" . }}.
+{{- if .Values.keeper.enabled }}
+Its keeper follows the releases of github.com/{{ .Values.keeper.githubRepository }}.
+{{- end }}
+
+Clients reach the gate on port {{ .Values.gate.port }}{{ if .Values.gate.hostPort }} (port {{ .Values.gate.hostPort }} of the pod's node){{ end }}.
+{{- if .Values.pool.enabled }}
+The website reaches the site API at http://{{ include "cliproxyapi.fullname" . }}-pool.{{ .Release.Namespace }}.svc:{{ .Values.pool.service.port }}
+{{- end }}
+
+Sign a subscription in from a shell in the pod, or from the website through the site API:
+  kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "cliproxyapi.fullname" . }} -c cliproxyapi -- ./CLIProxyAPI -config /etc/cliproxy/config.yaml -claude-login -no-browser

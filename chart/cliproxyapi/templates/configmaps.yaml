@@ -1,0 +1,95 @@
+{{- $name := include "cliproxyapi.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-gate
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+data:
+  haproxy.cfg: |
+    global
+      # normalize-uri and the runtime `set var` are experimental in 3.2.
+      expose-experimental-directives
+      log stdout format raw local0 info
+      stats socket ipv4@127.0.0.1:9999 level admin
+      stats timeout 1h
+
+    defaults
+      mode http
+      log global
+      option httplog
+      timeout connect 5s
+      timeout client 1h
+      timeout server 1h
+      timeout tunnel 2h
+      timeout http-keep-alive 5s
+      # A connection that sends nothing (or half its headers) would otherwise hold
+      # a drain open for `timeout client`.
+      timeout http-request 10s
+
+    frontend api
+      # HTTP/1 only: the drain cannot close h2c connections.
+      bind :{{ .Values.gate.port }} proto h1
+      http-request normalize-uri path-merge-slashes
+      http-request normalize-uri percent-decode-unreserved
+      http-request normalize-uri path-strip-dotdot
+      # The proxy routes on the decoded path, so no %-encoding gets through.
+      http-request deny if { path -m sub % }
+      http-request deny unless { path -m reg ^/v1(beta)?/ }
+      http-request del-header X-Forwarded-For
+      http-request del-header X-Real-IP
+      http-request del-header Forwarded
+      # Drain: keep-alive connections close after their current response.
+      http-after-response set-header Connection close if { var(proc.draining) -m int 1 }
+      default_backend cliproxy
+
+    backend cliproxy
+      server local 127.0.0.1:{{ .Values.proxy.port }}
+{{- if .Values.keeper.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-keeper
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+data:
+  keeper.sh: |
+    {{- .Files.Get "files/keeper.sh" | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-keeper
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+# The proxy's own Deployment and nothing else. The admission policy narrows it further.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-keeper
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ $name | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-keeper
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-keeper
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-keeper
+    namespace: {{ .Release.Namespace }}
+{{- end }}

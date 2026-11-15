@@ -1,0 +1,163 @@
+{{- /*
+The keeper's admission policy. The keeper's Role lets its account get and patch the proxy's
+Deployment. This narrows the patch to what the keeper is for: it may change
+- the image of the proxy's container, to a build of the fork (or back to the image of
+  upstream the Deployment ran before it followed the fork);
+- annotations whose keys start with `cliproxy/`.
+Every other field of the Deployment and its pod template has to stay as it was. The lists of
+pod and container fields are those of Kubernetes v1.35: check them again when the cluster is
+upgraded.
+
+It applies only to requests of the keeper's own account, so nobody else is bound by it.
+*/ -}}
+{{- if and .Values.keeper.enabled .Values.keeper.admissionPolicy.enabled }}
+{{- $name := include "cliproxyapi.fullname" . -}}
+{{- $policy := printf "%s-%s-keeper" .Release.Namespace $name -}}
+{{- $image := printf "^%s:v[0-9]+[.][0-9]+[.][0-9]+-pool[.][0-9]+@sha256:[0-9a-f]{64}$" (.Values.image.repository | replace "." "[.]") -}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $policy }}
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deployments"]
+  matchConditions:
+    - name: keeper-only
+      expression: >-
+        request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:{{ $name }}-keeper'
+  variables:
+    - name: newPod
+      expression: object.spec.template.spec
+    - name: oldPod
+      expression: oldObject.spec.template.spec
+    - name: newProxy
+      expression: "object.spec.template.spec.containers.filter(c, c.name == 'cliproxyapi')"
+    - name: oldProxy
+      expression: "oldObject.spec.template.spec.containers.filter(c, c.name == 'cliproxyapi')"
+    - name: newAnn
+      expression: "object.metadata.?annotations.orValue({})"
+    - name: oldAnn
+      expression: "oldObject.metadata.?annotations.orValue({})"
+  validations:
+    - expression: "request.operation == 'UPDATE' && request.name == '{{ $name }}'"
+      message: the keeper may only update deployment {{ $name }}
+    - expression: >-
+        object.metadata.?labels == oldObject.metadata.?labels &&
+        object.metadata.?finalizers == oldObject.metadata.?finalizers &&
+        object.metadata.?ownerReferences == oldObject.metadata.?ownerReferences
+      message: the keeper may not change labels, finalizers or owner references
+    - expression: >-
+        variables.newAnn.all(k, k.startsWith('cliproxy/') ||
+          (k in variables.oldAnn && variables.oldAnn[k] == variables.newAnn[k])) &&
+        variables.oldAnn.all(k, k.startsWith('cliproxy/') || k in variables.newAnn)
+      message: the keeper may change only cliproxy/* annotations
+    - expression: >-
+        object.spec.?minReadySeconds == oldObject.spec.?minReadySeconds &&
+        object.spec.?paused == oldObject.spec.?paused &&
+        object.spec.?progressDeadlineSeconds == oldObject.spec.?progressDeadlineSeconds &&
+        object.spec.?replicas == oldObject.spec.?replicas &&
+        object.spec.?revisionHistoryLimit == oldObject.spec.?revisionHistoryLimit &&
+        object.spec.?selector == oldObject.spec.?selector &&
+        object.spec.?strategy == oldObject.spec.?strategy &&
+        object.spec.template.?metadata == oldObject.spec.template.?metadata
+      message: the keeper may not change the deployment spec or the pod template metadata
+    - expression: >-
+        variables.newPod.?activeDeadlineSeconds == variables.oldPod.?activeDeadlineSeconds &&
+        variables.newPod.?affinity == variables.oldPod.?affinity &&
+        variables.newPod.?automountServiceAccountToken == variables.oldPod.?automountServiceAccountToken &&
+        variables.newPod.?dnsConfig == variables.oldPod.?dnsConfig &&
+        variables.newPod.?dnsPolicy == variables.oldPod.?dnsPolicy &&
+        variables.newPod.?enableServiceLinks == variables.oldPod.?enableServiceLinks &&
+        variables.newPod.?ephemeralContainers == variables.oldPod.?ephemeralContainers &&
+        variables.newPod.?hostAliases == variables.oldPod.?hostAliases &&
+        variables.newPod.?hostIPC == variables.oldPod.?hostIPC &&
+        variables.newPod.?hostNetwork == variables.oldPod.?hostNetwork &&
+        variables.newPod.?hostPID == variables.oldPod.?hostPID &&
+        variables.newPod.?hostUsers == variables.oldPod.?hostUsers &&
+        variables.newPod.?hostname == variables.oldPod.?hostname &&
+        variables.newPod.?hostnameOverride == variables.oldPod.?hostnameOverride &&
+        variables.newPod.?imagePullSecrets == variables.oldPod.?imagePullSecrets &&
+        variables.newPod.?initContainers == variables.oldPod.?initContainers &&
+        variables.newPod.?nodeName == variables.oldPod.?nodeName &&
+        variables.newPod.?nodeSelector == variables.oldPod.?nodeSelector &&
+        variables.newPod.?os == variables.oldPod.?os &&
+        variables.newPod.?overhead == variables.oldPod.?overhead &&
+        variables.newPod.?preemptionPolicy == variables.oldPod.?preemptionPolicy &&
+        variables.newPod.?priority == variables.oldPod.?priority &&
+        variables.newPod.?priorityClassName == variables.oldPod.?priorityClassName &&
+        variables.newPod.?readinessGates == variables.oldPod.?readinessGates &&
+        variables.newPod.?resourceClaims == variables.oldPod.?resourceClaims &&
+        variables.newPod.?resources == variables.oldPod.?resources &&
+        variables.newPod.?restartPolicy == variables.oldPod.?restartPolicy &&
+        variables.newPod.?runtimeClassName == variables.oldPod.?runtimeClassName &&
+        variables.newPod.?schedulerName == variables.oldPod.?schedulerName &&
+        variables.newPod.?schedulingGates == variables.oldPod.?schedulingGates &&
+        variables.newPod.?securityContext == variables.oldPod.?securityContext &&
+        variables.newPod.?serviceAccount == variables.oldPod.?serviceAccount &&
+        variables.newPod.?serviceAccountName == variables.oldPod.?serviceAccountName &&
+        variables.newPod.?setHostnameAsFQDN == variables.oldPod.?setHostnameAsFQDN &&
+        variables.newPod.?shareProcessNamespace == variables.oldPod.?shareProcessNamespace &&
+        variables.newPod.?subdomain == variables.oldPod.?subdomain &&
+        variables.newPod.?terminationGracePeriodSeconds == variables.oldPod.?terminationGracePeriodSeconds &&
+        variables.newPod.?tolerations == variables.oldPod.?tolerations &&
+        variables.newPod.?topologySpreadConstraints == variables.oldPod.?topologySpreadConstraints &&
+        variables.newPod.?volumes == variables.oldPod.?volumes &&
+        variables.newPod.?workloadRef == variables.oldPod.?workloadRef
+      message: the keeper may not change the pod spec
+    - expression: >-
+        variables.newPod.containers.filter(c, c.name != 'cliproxyapi') ==
+        variables.oldPod.containers.filter(c, c.name != 'cliproxyapi')
+      message: the keeper may not change containers other than cliproxyapi
+    - expression: >-
+        variables.newProxy.size() == 1 && variables.oldProxy.size() == 1 &&
+        variables.newProxy[0].?args == variables.oldProxy[0].?args &&
+        variables.newProxy[0].?command == variables.oldProxy[0].?command &&
+        variables.newProxy[0].?env == variables.oldProxy[0].?env &&
+        variables.newProxy[0].?envFrom == variables.oldProxy[0].?envFrom &&
+        variables.newProxy[0].?imagePullPolicy == variables.oldProxy[0].?imagePullPolicy &&
+        variables.newProxy[0].?lifecycle == variables.oldProxy[0].?lifecycle &&
+        variables.newProxy[0].?livenessProbe == variables.oldProxy[0].?livenessProbe &&
+        variables.newProxy[0].?ports == variables.oldProxy[0].?ports &&
+        variables.newProxy[0].?readinessProbe == variables.oldProxy[0].?readinessProbe &&
+        variables.newProxy[0].?resizePolicy == variables.oldProxy[0].?resizePolicy &&
+        variables.newProxy[0].?resources == variables.oldProxy[0].?resources &&
+        variables.newProxy[0].?restartPolicy == variables.oldProxy[0].?restartPolicy &&
+        variables.newProxy[0].?restartPolicyRules == variables.oldProxy[0].?restartPolicyRules &&
+        variables.newProxy[0].?securityContext == variables.oldProxy[0].?securityContext &&
+        variables.newProxy[0].?startupProbe == variables.oldProxy[0].?startupProbe &&
+        variables.newProxy[0].?stdin == variables.oldProxy[0].?stdin &&
+        variables.newProxy[0].?stdinOnce == variables.oldProxy[0].?stdinOnce &&
+        variables.newProxy[0].?terminationMessagePath == variables.oldProxy[0].?terminationMessagePath &&
+        variables.newProxy[0].?terminationMessagePolicy == variables.oldProxy[0].?terminationMessagePolicy &&
+        variables.newProxy[0].?tty == variables.oldProxy[0].?tty &&
+        variables.newProxy[0].?volumeDevices == variables.oldProxy[0].?volumeDevices &&
+        variables.newProxy[0].?volumeMounts == variables.oldProxy[0].?volumeMounts &&
+        variables.newProxy[0].?workingDir == variables.oldProxy[0].?workingDir
+      message: the keeper may change only the image of container cliproxyapi
+    - expression: >-
+        variables.newProxy[0].image == variables.oldProxy[0].image ||
+        variables.newProxy[0].image.matches('{{ $image }}') ||
+        variables.newProxy[0].image.matches('^eceasy/cli-proxy-api:v[0-9]+[.][0-9]+[.][0-9]+@sha256:[0-9a-f]{64}$')
+      message: the proxy image must be a build of the fork, {{ .Values.image.repository }}:<tag>@sha256:<digest>
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $policy }}
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  policyName: {{ $policy }}
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,41 @@
+{{- $name := include "cliproxyapi.fullname" . -}}
+{{- if not .Values.auth.existingClaim }}
+# The signed-in accounts. Kept when the release is removed: losing it signs every
+# subscription out.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-auth
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.auth.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.auth.size }}
+{{- end }}
+{{- if and .Values.pool.enabled (not .Values.pool.storage.existingClaim) }}
+---
+# The pool's tokens, rules and usage figures. Kept when the release is removed.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-pool
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.pool.storage.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.pool.storage.size }}
+{{- end }}

@@ -88,3 +88,46 @@ With the pool on:
   session affinity no longer decide, and a scheduler plugin is not asked;
 - the proxy does not start when the pool cannot: a state file it cannot read, or no site key.
 
+## Deploying it
+
+[`chart/cliproxyapi`](chart/cliproxyapi) is a Helm chart for the proxy with the pool: the
+proxy on loopback, a gate in front of it that the keeper drains before the proxy restarts,
+and the keeper, which keeps the proxy on this fork's latest build.
+
+```sh
+helm upgrade --install cliproxyapi chart/cliproxyapi --namespace cliproxyapi -f my-values.yaml
+```
+
+What has to exist first, in the namespace (the chart makes neither: both hold keys):
+
+- **The configuration**, a Secret (`config.existingSecret`, default `cliproxyapi-config`) with
+  upstream's `config.yaml` and, as `management-key`, the management key in clear. In
+  `config.yaml` the proxy listens on `127.0.0.1` and on `proxy.port` (8318), with
+  `management.secret-key` set and `management.allow-remote: false`.
+- **The site key**, a Secret (`pool.siteKey.existingSecret`, default `cliproxyapi-pool`) with
+  `site-key`: at least 32 characters, which the website holds too.
+- **A pull Secret** for this fork's image, named in `imagePullSecrets`.
+
+Create Secrets with `kubectl create` or `kubectl apply --server-side`, never with a plain
+`kubectl apply`, which copies their values into an annotation.
+
+Values worth setting:
+
+- `networkPolicy.clientCIDRs`: who reaches the gate. `networkPolicy.siteFrom`: the website's
+  pods, which reach the site API. Nothing else gets in.
+- `gate.hostPort`: clients reach the gate at the pod's node, port 8317. Pin the pod to that
+  node with `affinity` or `nodeSelector`.
+- `auth.existingClaim`: the disk of signed-in accounts, when there is one already.
+
+The route from outside the cluster is yours to make; the chart has none. Send it to the gate
+(port 8317), and never cut an answer short: a model answer streams for minutes.
+
+Things to know:
+
+- **Upgrading the chart leaves the proxy's image alone** once it runs a build of this fork:
+  the keeper moves it, and an upgrade must not undo that. `image.force: true` sets it.
+- **An upgrade that changes the pod restarts it at once**, and cuts the requests in flight.
+  To spare them, drain the gate first the way the keeper does (`files/keeper.sh`, `drain_on`).
+- **The two disks stay** when the release is removed (`helm.sh/resource-policy: keep`).
+- **The keeper's admission policy** is a cluster-wide object named after the namespace and
+  the release. It lists the pod fields of Kubernetes v1.35.

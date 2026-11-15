@@ -1,0 +1,99 @@
+# The proxy's image: a build of the fork, <upstream tag>-pool.<n>.
+image:
+  repository: ghcr.io/mach1212/cliproxyapi-fork
+  tag: "v8.0.72-pool.1"
+  # When set, the image is pinned by digest (repository:tag@digest).
+  digest: ""
+  pullPolicy: IfNotPresent
+  # false (the default): once the proxy runs a build of the fork, an upgrade of this chart
+  # leaves its image alone. The keeper is what moves it, and an upgrade must not undo that.
+  # The image above is then only what a first install starts from.
+  # true: this upgrade sets the image above, whatever runs.
+  force: false
+# For the fork's image, which is private.
+imagePullSecrets: []
+
+# The proxy's configuration: a Secret that already exists, with upstream's config.yaml and
+# the management key in clear. The chart does not make it: it holds the client keys.
+# In config.yaml the proxy has to listen on 127.0.0.1 and on `proxy.port` below, with the
+# management API on (management.secret-key set) and not remote (allow-remote: false).
+config:
+  existingSecret: cliproxyapi-config
+  key: config.yaml
+  managementKey: management-key
+
+proxy:
+  # The port the proxy itself listens on, on loopback only (config.yaml, server.port).
+  port: 8318
+  timezone: UTC
+  resources:
+    requests: {cpu: 20m, memory: 128Mi}
+    limits: {memory: 1Gi}
+
+# Where the signed-in accounts are kept (config.yaml, oauth.auth-dir, mounted at
+# /root/.cli-proxy-api). Losing it signs every subscription out.
+auth:
+  # A PersistentVolumeClaim that already exists. When set, the chart makes none.
+  existingClaim: ""
+  size: 1Gi
+  # Empty: the cluster's default storage class.
+  storageClassName: ""
+
+# The gate: HAProxy, the only listener clients reach. It lets only /v1/ and /v1beta/ paths
+# through, and the keeper drains it before the proxy restarts.
+gate:
+  port: 8317
+  # The port on the node, for clients that reach the node's own address. 0 for none.
+  hostPort: 8317
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {memory: 256Mi}
+
+# The pool (README of the fork): tokens that belong to people, rules per subscription, usage.
+pool:
+  enabled: true
+  # A Secret that already exists, with the key the site sends to the site API (at least 32
+  # characters). The site holds the same key.
+  siteKey:
+    existingSecret: cliproxyapi-pool
+    key: site-key
+  # The site API: a Service of its own, for the website alone.
+  service:
+    port: 8320
+  # The pool's state: tokens as hashes, the rules, the usage figures.
+  storage:
+    existingClaim: ""
+    size: 1Gi
+    storageClassName: ""
+
+# Who may connect. Everything else is refused, the proxy's own port and the gate's runtime
+# port included (both listen on loopback as well).
+networkPolicy:
+  enabled: true
+  # Addresses that reach the gate, for example the tailnet's range.
+  clientCIDRs: []
+  # Pods that reach the site API: [{namespace: default, podLabels: {app: website}}].
+  siteFrom: []
+
+# The keeper: keeps the proxy on the fork's latest build, draining the gate first.
+keeper:
+  enabled: true
+  image: alpine/k8s:1.35.8@sha256:aaeed1de1399aa816535d376c7d5c9bea905892301649ffaee0905397c7d4956
+  # The fork's repository on GitHub, whose latest release names the image.
+  githubRepository: Mach1212/cliproxyapi-fork
+  # An admission policy that holds the keeper to its one job: its account may change the
+  # proxy's image, to a build of the fork, and the cliproxy/* annotations. Nothing else.
+  # It is a cluster-wide object, checked against Kubernetes v1.35's pod fields.
+  admissionPolicy:
+    enabled: true
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {memory: 256Mi}
+
+# The image of the small helpers (the gate, and the copy of the configuration).
+haproxyImage: haproxy:3.2.25-alpine@sha256:5d97434a423c2533cfeb42874d45cf6d69a840b60334582dfbfd5008e94c80be
+
+# The pod has one disk and may hold a port of its node, so it runs once, on one node.
+nodeSelector: {}
+affinity: {}
+tolerations: []
