@@ -1,0 +1,171 @@
+name: Follow upstream's releases
+
+# When upstream has a release that this fork has not built with its current pool, build it
+# (build.sh), publish the image and name it in a release here.
+on:
+  schedule:
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release to build, such as v8.0.72. Empty: its latest release."
+        required: false
+        default: ""
+      again:
+        description: "Build it even if a build or a failed try of it is on record."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+concurrency:
+  group: follow-upstream
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  UPSTREAM: router-for-me/CLIProxyAPI
+  IMAGE: ghcr.io/mach1212/cliproxyapi-fork
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Which release, and whether it is on record already
+        id: plan
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          AGAIN: ${{ inputs.again }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          tag=${TAG_INPUT:-$latest}
+          [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected release tag: $tag" >&2; exit 1; }
+          # A build is made of the release and of what this fork adds to it.
+          key=$(git rev-parse HEAD:overlay HEAD:hooks.sh HEAD:build.sh HEAD:Dockerfile | sha256sum | cut -c1-16)
+          builds=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate |
+            jq -r --arg prefix "$tag-pool." --arg key "build-key: $key" \
+              '.[] | select(.tag_name | startswith($prefix)) | "\(.tag_name) \((.body // "") | contains($key))"')
+          if [ "$AGAIN" != true ] && grep -q ' true$' <<< "$builds"; then
+            echo "$tag is on record with this pool: built, or tried and failed."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(sed -n "s/^$tag-pool\.\([0-9]*\) .*/\1/p" <<< "$builds" | sort -n | tail -n 1)
+          {
+            echo "build=true"
+            echo "tag=$tag"
+            echo "name=$tag-pool.$((${last:-0} + 1))"
+            echo "key=$key"
+            echo "latest=$([ "$tag" = "$latest" ] && echo true || echo false)"
+            echo "go=$(curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$tag/go.mod" | sed -n 's/^go //p')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Go, the version the release names
+        if: steps.plan.outputs.build == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.plan.outputs.go }}
+          cache: false
+
+      - name: Build and check
+        id: build
+        if: steps.plan.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set +e
+          ./build.sh "$TAG" out
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      # A release the pool does not fit, or whose checks fail, fails this run once. The draft
+      # keeps later runs from trying it again until this fork's files change, and the issue says
+      # that someone has to look. The proxy stays on the last build that stood.
+      - name: Remember a release that does not stand
+        if: failure() && steps.build.outputs.code != ''
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          KEY: ${{ steps.plan.outputs.key }}
+          CODE: ${{ steps.build.outputs.code }}
+        run: |
+          set -euo pipefail
+          run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          if [ "$CODE" = 3 ]; then why="a hook does not fit"; else why="a check fails"; fi
+          gh release create "$NAME" --draft --target "$GITHUB_SHA" \
+            --title "CLIProxyAPI ${TAG#v}: $why" \
+            --notes "No build: $why with upstream's $TAG. The run that says which: $run
+
+          build-key: $KEY"
+          gh issue create --title "$TAG: $why" \
+            --body "The pool was not built for upstream's \`$TAG\`: $why. The run: $run
+
+          The proxy stays on the last build that stood. When \`overlay/\`, \`hooks.sh\` or \`build.sh\` change, the workflow tries \`$TAG\` (or whatever is upstream's latest by then) again." ||
+            echo "::warning::the issue could not be opened"
+
+      - name: Emulation, for the arm64 image's own setup
+        if: steps.plan.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.plan.outputs.build == 'true'
+
+      - name: Image
+        id: image
+        if: steps.plan.outputs.build == 'true'
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --file Dockerfile \
+            --tag "$IMAGE:$NAME" \
+            --build-arg "VERSION=${NAME#v}" \
+            --build-arg "COMMIT=${GITHUB_SHA::7}" \
+            --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.description=CLIProxyAPI ${TAG#v} with the pool" \
+            --metadata-file image.json \
+            out/src
+          digest=$(jq -r '."containerimage.digest"' image.json)
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "the push named no digest" >&2; exit 1; }
+          echo "ref=$IMAGE:$NAME@$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        if: steps.plan.outputs.build == 'true'
+        env:
+          NAME: ${{ steps.plan.outputs.name }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          KEY: ${{ steps.plan.outputs.key }}
+          LATEST: ${{ steps.plan.outputs.latest }}
+          REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # The proxy's keeper reads the "image:" line to know what to run.
+          gh release create "$NAME" --target "$GITHUB_SHA" --latest="$LATEST" \
+            --title "CLIProxyAPI ${TAG#v} with the pool, build ${NAME##*.}" \
+            --notes "Upstream's [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) with the pool of this fork at \`${GITHUB_SHA::7}\`.
+
+          image: $REF
+
+          build-key: $KEY"
+          # The list of builds; its commits also keep GitHub from switching the schedule off.
+          echo "- $(date -u +%F) [$NAME]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$NAME) \`$REF\`" >> builds.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add builds.md
+          git commit --quiet -m "build $NAME"
+          git pull --quiet --rebase
+          git push --quiet
