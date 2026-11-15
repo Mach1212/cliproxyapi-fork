@@ -3,6 +3,8 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +18,7 @@ import (
 type Weekly struct {
 	// Used is the share of the week's limit that is used, from 0 to 1.
 	Used float64
-	// UsedKnown is false for a subscription that reports no usage, such as Grok.
+	// UsedKnown is false until a subscription reports usage.
 	UsedKnown bool
 	// ResetAt is when the week's limit starts over, zero when not known.
 	ResetAt time.Time
@@ -103,21 +105,47 @@ func weekly(used float64, hasUsed bool, reset time.Time, hasReset bool, now time
 	return out
 }
 
-// probes holds, for accounts whose answers have not said it yet, the weekly limit read from
-// the provider's own usage page. The proxy forgets an account's headers when it restarts, and
-// an account that serves nothing has none; without this such an account would stay last in
-// line for ever.
+// ModelLimit is a limit the provider keeps for one model inside the week, such as Claude's
+// for Fable, as the account's usage page has it.
+type ModelLimit struct {
+	// Model is the provider's own name for the model.
+	Model string `json:"model"`
+	// Used is the share of that limit that is used, from 0 to 1.
+	Used    float64    `json:"used"`
+	ResetAt *time.Time `json:"reset_at"`
+}
+
+// usagePage is what a provider's own usage page says of an account right now.
+type usagePage struct {
+	// used, hasUsed and reset are the weekly limit's figures; reset is zero when the page
+	// names none.
+	used    float64
+	hasUsed bool
+	reset   time.Time
+	models  []ModelLimit
+}
+
+// namesReset tells whether the page names a weekly reset that is still to come.
+func (page usagePage) namesReset(now time.Time) bool {
+	return page.reset.After(now) && page.reset.Sub(now) <= weekHorizon
+}
+
+// probes holds what the usage pages said. The pool reads a page for what an account's own
+// answers do not tell it: the proxy forgets an account's headers when it restarts, an account
+// that serves nothing has none, Grok's answers carry no usage at all, and the limit of a
+// single model, such as Fable's, is only on the page.
 type probes struct {
 	mu      sync.Mutex
 	entries map[string]*probe
 }
 
 type probe struct {
-	used     float64
-	hasUsed  bool
-	reset    time.Time
+	page usagePage
+	// read is false while no read went well.
+	read     bool
 	triedAt  time.Time
 	wait     time.Duration
+	failed   bool
 	inFlight bool
 }
 
@@ -128,18 +156,36 @@ const (
 
 func newProbes() *probes { return &probes{entries: map[string]*probe{}} }
 
+// get returns the weekly limit as the account's page had it.
 func (ps *probes) get(id string, now time.Time) (Weekly, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	entry := ps.entries[id]
-	if entry == nil || entry.reset.IsZero() || !entry.reset.After(now) {
+	if entry == nil || !entry.read || !entry.page.namesReset(now) {
 		return Weekly{}, false
 	}
-	return weekly(entry.used, entry.hasUsed, entry.reset, true, now), true
+	return weekly(entry.page.used, entry.page.hasUsed, entry.page.reset, true, now), true
+}
+
+// modelLimits returns the limits of single models as the account's page had them, without
+// those that have started over since.
+func (ps *probes) modelLimits(id string, now time.Time) []ModelLimit {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	var limits []ModelLimit
+	if entry := ps.entries[id]; entry != nil {
+		for _, limit := range entry.page.models {
+			if limit.ResetAt == nil || limit.ResetAt.After(now) {
+				limits = append(limits, limit)
+			}
+		}
+	}
+	return limits
 }
 
 // weeklyOf is a subscription's weekly limit as far as the pool knows it: from the account's
-// own answers first, else from its usage page.
+// own answers first, which are newer than a page read up to ten minutes ago, else from its
+// usage page.
 func (p *Pool) weeklyOf(auth *coreauth.Auth, now time.Time) Weekly {
 	if auth == nil {
 		return Weekly{}
@@ -154,34 +200,34 @@ func (p *Pool) weeklyOf(auth *coreauth.Auth, now time.Time) Weekly {
 	return week
 }
 
-// probeUnknownResets asks the usage page of each Claude account that has no known weekly
-// reset. It goes through the proxy's management API, which puts the account's token in, so
-// the pool never holds one. That is no model request and uses nothing. While a page names no
-// reset, the wait before the next try doubles.
-func (p *Pool) probeUnknownResets(ctx context.Context) {
+// readUsagePages reads the usage page of every enabled Claude, Codex and Grok account that
+// is due: soon after the pool starts, and then every ten minutes. A page is read through the
+// proxy's management API, which puts the account's token in, so the pool never holds one.
+// That is no model request and uses nothing. While a page fails or names no weekly reset,
+// the wait before the next try doubles.
+func (p *Pool) readUsagePages(ctx context.Context) {
 	if p.cfg.ManagementKeyFile == "" {
 		return
 	}
 	now := p.now()
 	for _, auth := range p.manager.List() {
-		if auth == nil || auth.Disabled || !strings.EqualFold(auth.Provider, "claude") {
+		if ctx.Err() != nil {
+			return
+		}
+		if auth == nil || auth.Disabled {
 			continue
 		}
-		if !weeklyFromSignals(auth.Provider, auth.Quota.Signals, now).ResetAt.IsZero() {
+		source, ok := usageSources[strings.ToLower(auth.Provider)]
+		if !ok || !p.probes.begin(auth.ID, now) {
 			continue
 		}
-		if _, ok := p.probes.get(auth.ID, now); ok {
-			continue
-		}
-		if !p.probes.begin(auth.ID, now) {
-			continue
-		}
-		used, hasUsed, reset, err := p.askClaudeUsage(ctx, auth.EnsureIndex())
-		p.probes.end(auth.ID, used, hasUsed, reset, now)
-		if err != nil {
-			log.Warnf("pool: %s: its weekly reset is not known: %v", auth.ID, err)
-		} else {
-			log.Infof("pool: %s: weekly reset %s, read from its usage page", auth.ID, reset.UTC().Format("2006-01-02 15:04 MST"))
+		page, err := p.askUsage(ctx, auth, source)
+		p.probes.end(auth.ID, page, err == nil, now)
+		switch {
+		case err != nil:
+			log.Warnf("pool: %s: its usage page could not be read: %v", auth.ID, err)
+		case !page.namesReset(now):
+			log.Warnf("pool: %s: its usage page names no weekly reset", auth.ID)
 		}
 	}
 }
@@ -202,7 +248,7 @@ func (ps *probes) begin(id string, now time.Time) bool {
 	return true
 }
 
-func (ps *probes) end(id string, used float64, hasUsed bool, reset time.Time, now time.Time) {
+func (ps *probes) end(id string, page usagePage, read bool, now time.Time) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	entry := ps.entries[id]
@@ -210,68 +256,231 @@ func (ps *probes) end(id string, used float64, hasUsed bool, reset time.Time, no
 		return
 	}
 	entry.inFlight = false
-	if !reset.IsZero() && reset.After(now) && reset.Sub(now) <= weekHorizon {
-		entry.used, entry.hasUsed, entry.reset, entry.wait = used, hasUsed, reset, 0
-		return
+	if read {
+		entry.page, entry.read = page, true
+		if page.namesReset(now) {
+			entry.wait, entry.failed = probeWait, false
+			return
+		}
 	}
-	entry.reset = time.Time{}
 	switch {
-	case entry.wait == 0:
+	case !entry.failed:
 		entry.wait = probeWait
 	case entry.wait*2 > probeWaitMax:
 		entry.wait = probeWaitMax
 	default:
 		entry.wait *= 2
 	}
+	entry.failed = true
 }
 
-const (
-	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
-	// What the proxy's own control panel sends, so Anthropic sees the same from both.
-	claudeUsageAgent = "claude-cli/2.1.280 (external, cli)"
-)
+// usageSource is where a provider keeps an account's usage page and how to read it. The
+// headers are what the proxy's own control panel sends, so the provider sees the same from
+// both.
+type usageSource struct {
+	url    string
+	header map[string]string
+	read   func(body []byte) (usagePage, error)
+}
 
-func (p *Pool) askClaudeUsage(ctx context.Context, authIndex string) (used float64, hasUsed bool, reset time.Time, err error) {
-	request := map[string]any{
-		"auth_index": authIndex,
-		"method":     "GET",
-		"url":        claudeUsageURL,
-		"header": map[string]string{
-			"User-Agent":     claudeUsageAgent,
+var usageSources = map[string]usageSource{
+	"claude": {
+		url: "https://api.anthropic.com/api/oauth/usage",
+		header: map[string]string{
+			"User-Agent":     "claude-cli/2.1.280 (external, cli)",
 			"Authorization":  "Bearer $TOKEN$",
 			"Accept":         "application/json",
 			"Content-Type":   "application/json",
 			"anthropic-beta": "oauth-2025-04-20",
 		},
+		read: readClaudeUsage,
+	},
+	"codex": {
+		url: "https://chatgpt.com/backend-api/wham/usage",
+		header: map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+			"Content-Type":  "application/json",
+			"OpenAI-Beta":   "codex-1",
+			"Originator":    "Codex Desktop",
+		},
+		read: readCodexUsage,
+	},
+	"xai": {
+		url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+		header: map[string]string{
+			"Authorization":         "Bearer $TOKEN$",
+			"x-xai-token-auth":      "xai-grok-cli",
+			"x-grok-client-version": "1.0.77",
+			"User-Agent":            "grok-cli/1.0.77",
+		},
+		read: readGrokUsage,
+	},
+}
+
+func (p *Pool) askUsage(ctx context.Context, auth *coreauth.Auth, source usageSource) (usagePage, error) {
+	header := maps.Clone(source.header)
+	if account, _ := auth.Metadata["account_id"].(string); account != "" && strings.EqualFold(auth.Provider, "codex") {
+		header["Chatgpt-Account-Id"] = account
+	}
+	request := map[string]any{
+		"auth_index": auth.EnsureIndex(),
+		"method":     "GET",
+		"url":        source.url,
+		"header":     header,
 	}
 	var answer struct {
 		StatusCode int    `json:"status_code"`
 		Body       string `json:"body"`
 	}
 	if err := p.management(ctx, "POST", "/requests/api-call", request, &answer); err != nil {
-		return 0, false, time.Time{}, err
+		return usagePage{}, err
 	}
 	if answer.StatusCode != 200 {
-		return 0, false, time.Time{}, errStatus("its usage page", answer.StatusCode)
+		return usagePage{}, errStatus("it", answer.StatusCode)
 	}
-	var page struct {
-		SevenDay struct {
-			Utilization *float64 `json:"utilization"`
-			ResetsAt    string   `json:"resets_at"`
-		} `json:"seven_day"`
+	return source.read([]byte(answer.Body))
+}
+
+// A page that does not look like a usage page is an error, not a page that names nothing:
+// the log then says so, and what the pool read before stays.
+var errNotUsagePage = errText("it is not in a shape the pool knows")
+
+func readClaudeUsage(body []byte) (usagePage, error) {
+	var raw struct {
+		// Null for an account that has not used its week yet, which is not the same as a
+		// page without it.
+		SevenDay json.RawMessage `json:"seven_day"`
+		Limits   []struct {
+			Kind string `json:"kind"`
+			// Percent is 0 to 100.
+			Percent  *float64 `json:"percent"`
+			ResetsAt string   `json:"resets_at"`
+			Scope    *struct {
+				Model *struct {
+					DisplayName string `json:"display_name"`
+				} `json:"model"`
+			} `json:"scope"`
+		} `json:"limits"`
 	}
-	if err := json.Unmarshal([]byte(answer.Body), &page); err != nil {
-		return 0, false, time.Time{}, errText("its usage page could not be read")
+	if err := json.Unmarshal(body, &raw); err != nil || (raw.SevenDay == nil && raw.Limits == nil) {
+		return usagePage{}, errNotUsagePage
 	}
-	at, errParse := time.Parse(time.RFC3339Nano, page.SevenDay.ResetsAt)
-	if errParse != nil {
-		return 0, false, time.Time{}, errText("its usage page names no weekly reset")
+	var page usagePage
+	var week *struct {
+		// Utilization is 0 to 100.
+		Utilization *float64 `json:"utilization"`
+		ResetsAt    string   `json:"resets_at"`
 	}
-	if page.SevenDay.Utilization != nil {
-		// The page gives percent.
-		used, hasUsed = *page.SevenDay.Utilization/100, true
+	if len(raw.SevenDay) > 0 {
+		if err := json.Unmarshal(raw.SevenDay, &week); err != nil {
+			return usagePage{}, errNotUsagePage
+		}
 	}
-	return used, hasUsed, at, nil
+	if week != nil {
+		if week.Utilization != nil {
+			page.used, page.hasUsed = *week.Utilization/100, true
+		}
+		if at, err := time.Parse(time.RFC3339Nano, week.ResetsAt); err == nil {
+			page.reset = at
+		}
+	}
+	// The limits of single models, such as Fable's, are only in this list. One counts whether
+	// or not it is the limit the account is closest to.
+	for _, limit := range raw.Limits {
+		if limit.Kind != "weekly_scoped" || limit.Percent == nil || limit.Scope == nil || limit.Scope.Model == nil {
+			continue
+		}
+		name := strings.TrimSpace(limit.Scope.Model.DisplayName)
+		if name == "" {
+			continue
+		}
+		model := ModelLimit{Model: name, Used: min(max(*limit.Percent/100, 0), 1)}
+		if at, err := time.Parse(time.RFC3339Nano, limit.ResetsAt); err == nil {
+			at = at.UTC()
+			model.ResetAt = &at
+		}
+		page.models = append(page.models, model)
+	}
+	slices.SortStableFunc(page.models, func(a, b ModelLimit) int { return strings.Compare(a.Model, b.Model) })
+	return page, nil
+}
+
+func readCodexUsage(body []byte) (usagePage, error) {
+	type window struct {
+		// UsedPercent is 0 to 100.
+		UsedPercent *float64 `json:"used_percent"`
+		Seconds     float64  `json:"limit_window_seconds"`
+		// ResetAt is in Unix seconds.
+		ResetAt float64 `json:"reset_at"`
+	}
+	var raw struct {
+		// Null for an account without a limit, which is not the same as a page without it.
+		RateLimit json.RawMessage `json:"rate_limit"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil || raw.RateLimit == nil {
+		return usagePage{}, errNotUsagePage
+	}
+	var limit *struct {
+		Primary   *window `json:"primary_window"`
+		Secondary *window `json:"secondary_window"`
+	}
+	if err := json.Unmarshal(raw.RateLimit, &limit); err != nil {
+		return usagePage{}, errNotUsagePage
+	}
+	var page usagePage
+	if limit == nil {
+		return page, nil
+	}
+	// The weekly window is the one of seven days, else the longer of the two, as with the
+	// headers.
+	var week *window
+	for _, w := range []*window{limit.Primary, limit.Secondary} {
+		if w == nil {
+			continue
+		}
+		if w.Seconds == 604800 {
+			week = w
+			break
+		}
+		if week == nil || w.Seconds > week.Seconds {
+			week = w
+		}
+	}
+	if week != nil {
+		if week.UsedPercent != nil {
+			page.used, page.hasUsed = *week.UsedPercent/100, true
+		}
+		if week.ResetAt > 0 {
+			page.reset = time.Unix(int64(week.ResetAt), 0)
+		}
+	}
+	return page, nil
+}
+
+func readGrokUsage(body []byte) (usagePage, error) {
+	var raw struct {
+		Config *struct {
+			CurrentPeriod *struct {
+				Type string `json:"type"`
+				End  string `json:"end"`
+			} `json:"currentPeriod"`
+			// CreditUsagePercent is 0 to 100. Grok leaves it out when nothing is used.
+			CreditUsagePercent float64 `json:"creditUsagePercent"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return usagePage{}, errNotUsagePage
+	}
+	var page usagePage
+	// An account whose period is not a week has no weekly limit to report.
+	if raw.Config == nil || raw.Config.CurrentPeriod == nil || raw.Config.CurrentPeriod.Type != "USAGE_PERIOD_TYPE_WEEKLY" {
+		return page, nil
+	}
+	page.used, page.hasUsed = raw.Config.CreditUsagePercent/100, true
+	if at, err := time.Parse(time.RFC3339Nano, raw.Config.CurrentPeriod.End); err == nil {
+		page.reset = at
+	}
+	return page, nil
 }
 
 // refusesUntil tells whether the account's last answer for one of these models was a refusal

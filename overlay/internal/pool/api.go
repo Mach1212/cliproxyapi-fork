@@ -204,12 +204,13 @@ type Subscription struct {
 	StatusMessage string `json:"status_message,omitempty"`
 	Weekly        struct {
 		// Used is the share of the week's limit that is used, 0 to 1. It is only meaningful
-		// with UsedKnown: Grok reports none.
+		// with UsedKnown.
 		Used      float64    `json:"used"`
 		UsedKnown bool       `json:"used_known"`
 		ResetAt   *time.Time `json:"reset_at"`
 	} `json:"weekly"`
-	Rule Rule `json:"rule"`
+	ModelLimits []ModelLimit `json:"model_limits,omitempty"`
+	Rule        Rule         `json:"rule"`
 }
 
 func accountEmail(auth *coreauth.Auth) string {
@@ -240,6 +241,7 @@ func (p *Pool) subscriptions() []Subscription {
 			Status:        string(auth.Status),
 			StatusMessage: auth.StatusMessage,
 			Rule:          p.state.rule(auth.ID),
+			ModelLimits:   p.probes.modelLimits(auth.ID, now),
 		}
 		week := p.weeklyOf(auth, now)
 		sub.Weekly.Used, sub.Weekly.UsedKnown = week.Used, week.UsedKnown

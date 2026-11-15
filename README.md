@@ -78,7 +78,7 @@ shape:
 | `POOL_STATE_DIR` | Where the pool keeps `state.json` (tokens as hashes, rules) and `usage.json`. Setting it turns the pool on. Keep it on a disk that lasts. |
 | `POOL_LISTEN` | The site API's address. Default `:8320`; empty for no site API. |
 | `POOL_SITE_KEY_FILE` | A file with the site API's key, at least 32 characters. |
-| `POOL_MANAGEMENT_URL` | The proxy's own management API, default `http://127.0.0.1:8317/v8/management`. The pool calls it over loopback to sign subscriptions in, to remove one, and to read a Claude account's weekly reset from its usage page. |
+| `POOL_MANAGEMENT_URL` | The proxy's own management API, default `http://127.0.0.1:8317/v8/management`. The pool calls it over loopback to sign subscriptions in, to remove one, and to read an account's usage page for its weekly usage, its weekly reset and the limits of single models. |
 | `POOL_MANAGEMENT_KEY_FILE` | A file with the management key in clear. Without it those three things do not work; the rest does. |
 
 With the pool on:

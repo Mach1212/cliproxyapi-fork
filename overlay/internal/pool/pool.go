@@ -144,8 +144,8 @@ func newPool(cfg Config, manager *coreauth.Manager) (*Pool, error) {
 	return p, nil
 }
 
-// run keeps what the pool holds in memory on disk, and reads the weekly reset of accounts
-// that have not told it yet. It ends with ctx, after a last save.
+// run keeps what the pool holds in memory on disk and refreshes account usage pages.
+// It ends with ctx, after a last save.
 func (p *Pool) run(ctx context.Context) {
 	save := time.NewTicker(5 * time.Second)
 	defer save.Stop()
@@ -159,7 +159,7 @@ func (p *Pool) run(ctx context.Context) {
 		case <-save.C:
 			p.flush()
 		case <-probe.C:
-			p.probeUnknownResets(ctx)
+			p.readUsagePages(ctx)
 		}
 	}
 }

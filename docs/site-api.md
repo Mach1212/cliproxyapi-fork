@@ -49,15 +49,28 @@ named they are nobody's, and use only what is shared with everyone.
   "disabled": false,
   "status": "active",
   "weekly": {"used": 0.68, "used_known": true, "reset_at": "2026-11-16T23:00:00Z"},
+  "model_limits": [{"model": "Fable", "used": 0.93, "reset_at": "2026-11-21T02:59:59Z"}],
   "rule": {"owner": "user_ada", "share": "everyone", "reserve_percent": 20,
            "blocked_models": ["claude-fable-*"], "block_fast_mode": true}
 }]}
 ```
 
 - `weekly.used` is the share of the week's limit that is used, 0 to 1, and counts only with
-  `used_known`. Claude and Codex accounts report it. Grok reports nothing, so a reserve on a
-  Grok subscription has no effect.
-- `weekly.reset_at` is `null` until the account has said it.
+  `used_known`. Claude, Codex and Grok accounts report it, including accounts that have
+  served no model request since startup. A reserve applies to each when usage is known.
+- `weekly.reset_at` is `null` until a weekly reset is known. Readings whose reset has
+  passed are dropped. Resets more than seven days and one hour away are not used.
+- The pool reads each enabled Claude, Codex and Grok account's own usage page within
+  about a minute of startup and refreshes it about every ten minutes. This requires
+  `POOL_MANAGEMENT_KEY_FILE`. Failed reads and pages without a weekly reset back off,
+  doubling the wait up to six hours. Disabled accounts are not read.
+- The figures of an account's own answers count while the weekly reset they name is still
+  ahead: they are newer than a page read up to ten minutes ago. Otherwise the page's do.
+- `model_limits` comes from the usage page and is omitted when empty. Each entry has
+  `model`, the provider's display name, `used`, a share from 0 to 1, and `reset_at`,
+  an RFC 3339 time or `null` when unknown. Claude reports its weekly limits for individual
+  models, such as Fable, whether the provider marks the limit active or inactive.
+  Entries are sorted by model name and dropped once their reset has passed.
 
 ### The rule
 
