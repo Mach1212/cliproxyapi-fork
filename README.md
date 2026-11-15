@@ -106,7 +106,7 @@ What has to exist first, in the namespace (the chart makes neither: both hold ke
   `management.secret-key` set and `management.allow-remote: false`.
 - **The site key**, a Secret (`pool.siteKey.existingSecret`, default `cliproxyapi-pool`) with
   `site-key`: at least 32 characters, which the website holds too.
-- **A pull Secret** for this fork's image, named in `imagePullSecrets`.
+- Nothing for the image: it is public. (`imagePullSecrets` is there for a private copy.)
 
 Create Secrets with `kubectl create` or `kubectl apply --server-side`, never with a plain
 `kubectl apply`, which copies their values into an annotation.

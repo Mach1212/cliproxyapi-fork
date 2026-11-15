@@ -10,7 +10,7 @@ image:
   # The image above is then only what a first install starts from.
   # true: this upgrade sets the image above, whatever runs.
   force: false
-# For the fork's image, which is private.
+# For an image that needs a login. The fork's own image is public.
 imagePullSecrets: []
 
 # The proxy's configuration: a Secret that already exists, with upstream's config.yaml and

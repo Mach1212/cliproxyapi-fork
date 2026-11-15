@@ -234,7 +234,7 @@ spec:
         {{- if .Values.keeper.enabled }}
         - name: keeper
           configMap:
-            name: {{ $name }}-keeper
+            name: {{ $name }}-keeper-script
         - name: keeper-state
           emptyDir:
             sizeLimit: 1Mi

@@ -50,7 +50,7 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ $name }}-keeper
+  name: {{ $name }}-keeper-script
   labels:
     {{- include "cliproxyapi.labels" . | nindent 4 }}
 data:
