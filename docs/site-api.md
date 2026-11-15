@@ -82,6 +82,10 @@ Of the accounts that can serve it right now and that the person may use, the one
 weekly reset is closest, whoever owns it. Accounts that have not said their reset come last.
 The rule decides only whether an account is among them, never the order.
 
+One thing comes before the reset: a Claude account whose last answer for the model was a
+refusal that lasts until its limit starts over (a full Fable limit, say) is asked after the
+accounts that did not refuse, and still serves its other models first.
+
 When none is left, the request is refused with a message that says why:
 
 | status | `code` | when |

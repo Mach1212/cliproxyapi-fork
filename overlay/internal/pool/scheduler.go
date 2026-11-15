@@ -27,14 +27,20 @@ func (s *scheduler) SchedulerWantsAcrossPriorities() bool { return true }
 type candidate struct {
 	id   string
 	week Weekly
+	// refuses is set when the account's last answer for this model was a refusal that lasts.
+	refuses bool
 }
 
 // byClosestReset orders accounts with a known weekly reset first, the closest first, then
-// the others. Ties go by id, so the order is the same every time.
+// the others. An account that refuses the model until its limit starts over comes after all
+// that do not: it is asked only when nothing else is left, in case what it said is out of
+// date. Ties go by id, so the order is the same every time.
 func byClosestReset(candidates []candidate) {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
 		switch {
+		case a.refuses != b.refuses:
+			return !a.refuses
 		case a.week.ResetAt.IsZero() != b.week.ResetAt.IsZero():
 			return !a.week.ResetAt.IsZero()
 		case !a.week.ResetAt.Equal(b.week.ResetAt):
@@ -77,7 +83,8 @@ func (s *scheduler) PickAuth(ctx context.Context, req pluginapi.SchedulerPickReq
 				continue
 			}
 		}
-		eligible = append(eligible, candidate{id: auth.ID, week: week})
+		_, refuses := refusesUntil(auth, models, now)
+		eligible = append(eligible, candidate{id: auth.ID, week: week, refuses: refuses})
 	}
 	if len(eligible) == 0 {
 		return pluginapi.SchedulerPickResponse{}, true, refusal(models[0], denials, soonest)

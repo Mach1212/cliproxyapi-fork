@@ -27,6 +27,8 @@ const siteKey = "site-key-site-key-site-key-site-key-0123"
 type account struct {
 	id, provider string
 	signals      map[string]string
+	// refuses names models the account refused in its last answer, and for how long from now.
+	refuses map[string]time.Duration
 }
 
 func claude(id string, used float64, resetIn time.Duration) account {
@@ -43,6 +45,17 @@ func newTestPool(t *testing.T, accounts ...account) *Pool {
 	for _, a := range accounts {
 		auth := &coreauth.Auth{ID: a.id, Provider: a.provider, Status: coreauth.StatusActive}
 		auth.Quota.Signals = a.signals
+		for model, wait := range a.refuses {
+			if auth.ModelStates == nil {
+				auth.ModelStates = map[string]*coreauth.ModelState{}
+			}
+			state := &coreauth.ModelState{Status: coreauth.StatusActive}
+			state.Quota.Signals = map[string]string{
+				"Anthropic-Ratelimit-Unified-Status": "rejected",
+				"Anthropic-Ratelimit-Unified-Reset":  strconv.FormatInt(testNow.Add(wait).Unix(), 10),
+			}
+			auth.ModelStates[model] = state
+		}
 		if _, err := manager.Register(context.Background(), auth); err != nil {
 			t.Fatalf("registering %s: %v", a.id, err)
 		}
@@ -632,5 +645,28 @@ func TestSigningASubscriptionInGoesThroughTheManagementAPI(t *testing.T) {
 	}
 	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
 		t.Errorf("calls to the management API:\n%s", strings.Join(calls, "\n"))
+	}
+}
+
+func TestAnAccountThatRefusesTheModelIsAskedLast(t *testing.T) {
+	near := claude("near.json", 0.86, 5*time.Hour)
+	near.refuses = map[string]time.Duration{"claude-fable-5-2": 5 * time.Hour}
+	stale := claude("stale.json", 0.5, 2*24*time.Hour)
+	stale.refuses = map[string]time.Duration{"claude-fable-5-2": -time.Hour}
+	p := newTestPool(t, near, stale, claude("far.json", 0.33, 6*24*time.Hour))
+	all := []string{"far.json", "stale.json", "near.json"}
+
+	// Fable's limit is full on the account that resets first, so the next closest is asked.
+	// A refusal whose time has passed counts for nothing.
+	if got, _ := pick(t, p, as("ada"), "claude-fable-5-2", all...); got != "stale.json" {
+		t.Errorf("fable: got %q, want stale.json", got)
+	}
+	// The same account still comes first for the models it serves.
+	if got, _ := pick(t, p, as("ada"), "claude-haiku-4-5", all...); got != "near.json" {
+		t.Errorf("haiku: got %q, want near.json", got)
+	}
+	// With nothing else left it is asked after all: what it said may be out of date.
+	if got, err := pick(t, p, as("ada"), "claude-fable-5-2", "near.json"); err != nil || got != "near.json" {
+		t.Errorf("fable, as the last one left: got %q, %v", got, err)
 	}
 }

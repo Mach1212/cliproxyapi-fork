@@ -273,3 +273,40 @@ func (p *Pool) askClaudeUsage(ctx context.Context, authIndex string) (used float
 	}
 	return used, hasUsed, at, nil
 }
+
+// refusesUntil tells whether the account's last answer for one of these models was a refusal
+// that lasts: Anthropic says so in the answer's headers, with the time the limit starts over.
+// That is how a full limit of one model shows, such as Fable's, while the account still
+// serves its other models. The proxy does not set such an account aside by itself.
+func refusesUntil(auth *coreauth.Auth, models []string, now time.Time) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(auth.Provider, "claude") {
+		return time.Time{}, false
+	}
+	for stateModel, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		matches := false
+		for _, model := range models {
+			if modelName(stateModel) == modelName(model) {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		status, _ := signal(state.Quota.Signals, "anthropic-ratelimit-unified-status")
+		if !strings.EqualFold(status, "rejected") {
+			continue
+		}
+		raw, ok := signal(state.Quota.Signals, "anthropic-ratelimit-unified-reset")
+		if !ok {
+			continue
+		}
+		if until, ok := unixSeconds(raw); ok && until.After(now) {
+			return until, true
+		}
+	}
+	return time.Time{}, false
+}
