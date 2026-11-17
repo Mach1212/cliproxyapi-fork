@@ -3,8 +3,10 @@ name: Follow upstream's releases
 # When upstream has a release that this fork has not built with its current pool, build it
 # (build.sh), publish the image and name it in a release here.
 on:
+  # Every hour, as often as the proxy's keeper looks for a build. GitHub starts a scheduled
+  # run late and leaves many out, so asking more often is what keeps a release from waiting.
   schedule:
-    - cron: "23 */3 * * *"
+    - cron: "23 * * * *"
   workflow_dispatch:
     inputs:
       tag:
@@ -87,8 +89,9 @@ jobs:
           exit "$code"
 
       # A release the pool does not fit, or whose checks fail, fails this run once. The draft
-      # keeps later runs from trying it again until this fork's files change, and the issue says
-      # that someone has to look. The proxy stays on the last build that stood.
+      # keeps later runs from trying it again until this fork's files change. The issue tells
+      # the fork's owner, who is assigned to it: GitHub notifies an assignee whether or not
+      # they watch the repository. The proxy stays on the last build that stood.
       - name: Remember a release that does not stand
         if: failure() && steps.build.outputs.code != ''
         env:
@@ -105,7 +108,8 @@ jobs:
             --notes "No build: $why with upstream's $TAG. The run that says which: $run
 
           build-key: $KEY"
-          gh issue create --title "$TAG: $why" \
+          gh issue create --assignee "$GITHUB_REPOSITORY_OWNER" \
+            --title "Upstream $TAG was not merged: $why" \
             --body "The pool was not built for upstream's \`$TAG\`: $why. The run: $run
 
           The proxy stays on the last build that stood. When \`overlay/\`, \`hooks.sh\` or \`build.sh\` change, the workflow tries \`$TAG\` (or whatever is upstream's latest by then) again." ||

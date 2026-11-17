@@ -31,7 +31,7 @@ image takes this one unchanged.
 
 ## How it follows upstream
 
-[A workflow](.github/workflows/follow-upstream.yml) runs every three hours. It asks upstream
+[A workflow](.github/workflows/follow-upstream.yml) runs every hour. It asks upstream
 for its latest release and, if this fork has no build of it with the current pool, runs
 [`build.sh`](build.sh) and publishes the result.
 
@@ -52,8 +52,9 @@ A build is published only when it stands:
 4. the built program passes an end-to-end run against a stand-in for Anthropic, which checks
    from the outside that each hook is in place.
 
-When a release does not stand, that run fails once, an issue is opened here, and no build of
-it appears until the fork's files change or upstream releases again. Earlier builds stay as
+When a release does not stand, that run fails once, an issue is opened here and assigned to
+the fork's owner, and no build of it appears until the fork's files change or upstream
+releases again. Earlier builds stay as
 they are, so a proxy that follows this fork's releases stays on the last one that stood.
 
 ## Building one yourself
