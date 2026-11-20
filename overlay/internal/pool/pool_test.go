@@ -648,6 +648,37 @@ func TestSigningASubscriptionInGoesThroughTheManagementAPI(t *testing.T) {
 	}
 }
 
+func TestAGoogleSubscriptionIsSignedInAsAntigravity(t *testing.T) {
+	var calls []string
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.RequestURI())
+		switch r.URL.Path {
+		case "/oauth/auth-url":
+			_, _ = w.Write([]byte(`{"status":"ok","url":"https://accounts.google.com/o/oauth2/v2/auth?state=G1","state":"G1"}`))
+		case "/oauth/callback":
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer management.Close()
+	p := newTestPool(t)
+	p.cfg.ManagementURL, p.cfg.ManagementKeyFile = management.URL, p.cfg.SiteKeyFile
+	ctx := context.Background()
+
+	start, err := p.startSignin(ctx, "antigravity", "", Rule{Owner: "ada"})
+	if err != nil || start.State != "G1" || start.Flow != "paste" {
+		t.Fatalf("starting: %+v, %v", start, err)
+	}
+	// Google's address carries the scopes, and a code with a slash in it.
+	if err := p.signinCallback(ctx, "G1", "http://localhost:51121/oauth-callback?state=G1&code=4%2F0AbCd&scope=email%20https://www.googleapis.com/auth/cloud-platform"); err != nil {
+		t.Fatalf("handing the address over: %v", err)
+	}
+	if got, want := strings.Join(calls, "\n"), "POST /oauth/auth-url?provider=antigravity\nPOST /oauth/callback"; got != want {
+		t.Errorf("calls to the management API:\n%s", got)
+	}
+}
+
 func TestAnAccountThatRefusesTheModelIsAskedLast(t *testing.T) {
 	near := claude("near.json", 0.86, 5*time.Hour)
 	near.refuses = map[string]time.Duration{"claude-fable-5-2": 5 * time.Hour}

@@ -130,10 +130,27 @@ func (page usagePage) namesReset(now time.Time) bool {
 	return page.reset.After(now) && page.reset.Sub(now) <= weekHorizon
 }
 
+// with puts another answer for the same page together with this one. What this one has
+// stays: the other adds only the week's figures when this one has none, and the limits of
+// models this one does not name.
+func (page usagePage) with(other usagePage) usagePage {
+	if !page.hasUsed && page.reset.IsZero() {
+		page.used, page.hasUsed, page.reset = other.used, other.hasUsed, other.reset
+	}
+	page.models = slices.Clone(page.models)
+	for _, limit := range other.models {
+		if !slices.ContainsFunc(page.models, func(known ModelLimit) bool { return known.Model == limit.Model }) {
+			page.models = append(page.models, limit)
+		}
+	}
+	slices.SortStableFunc(page.models, func(a, b ModelLimit) int { return strings.Compare(a.Model, b.Model) })
+	return page
+}
+
 // probes holds what the usage pages said. The pool reads a page for what an account's own
 // answers do not tell it: the proxy forgets an account's headers when it restarts, an account
-// that serves nothing has none, Grok's answers carry no usage at all, and the limit of a
-// single model, such as Fable's, is only on the page.
+// that serves nothing has none, Grok's and Google's answers carry no usage at all, and the
+// limit of a single model, such as Fable's, is only on the page.
 type probes struct {
 	mu      sync.Mutex
 	entries map[string]*probe
@@ -200,9 +217,9 @@ func (p *Pool) weeklyOf(auth *coreauth.Auth, now time.Time) Weekly {
 	return week
 }
 
-// readUsagePages reads the usage page of every enabled Claude, Codex and Grok account that
-// is due: soon after the pool starts, and then every ten minutes. A page is read through the
-// proxy's management API, which puts the account's token in, so the pool never holds one.
+// readUsagePages reads the usage page of every enabled Claude, Codex, Grok and Google account
+// that is due: soon after the pool starts, and then every ten minutes. A page is read through
+// the proxy's management API, which puts the account's token in, so the pool never holds one.
 // That is no model request and uses nothing. While a page fails or names no weekly reset,
 // the wait before the next try doubles.
 func (p *Pool) readUsagePages(ctx context.Context) {
@@ -275,17 +292,21 @@ func (ps *probes) end(id string, page usagePage, read bool, now time.Time) {
 }
 
 // usageSource is where a provider keeps an account's usage page and how to read it. The
-// headers are what the proxy's own control panel sends, so the provider sees the same from
-// both.
+// addresses, the headers and the body are what the proxy's own control panel sends, so the
+// provider sees the same from both.
 type usageSource struct {
-	url    string
+	// urls are the page's addresses. Where there are several, they are asked in turn, and each
+	// answer is put together with the ones before, until the page has the week's figure.
+	urls   []string
 	header map[string]string
-	read   func(body []byte) (usagePage, error)
+	// body, when there is one, is sent with a POST. It can need what the account knows.
+	body func(auth *coreauth.Auth) (string, error)
+	read func(body []byte) (usagePage, error)
 }
 
 var usageSources = map[string]usageSource{
 	"claude": {
-		url: "https://api.anthropic.com/api/oauth/usage",
+		urls: []string{"https://api.anthropic.com/api/oauth/usage"},
 		header: map[string]string{
 			"User-Agent":     "claude-cli/2.1.280 (external, cli)",
 			"Authorization":  "Bearer $TOKEN$",
@@ -296,7 +317,7 @@ var usageSources = map[string]usageSource{
 		read: readClaudeUsage,
 	},
 	"codex": {
-		url: "https://chatgpt.com/backend-api/wham/usage",
+		urls: []string{"https://chatgpt.com/backend-api/wham/usage"},
 		header: map[string]string{
 			"Authorization": "Bearer $TOKEN$",
 			"Content-Type":  "application/json",
@@ -306,7 +327,7 @@ var usageSources = map[string]usageSource{
 		read: readCodexUsage,
 	},
 	"xai": {
-		url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+		urls: []string{"https://cli-chat-proxy.grok.com/v1/billing?format=credits"},
 		header: map[string]string{
 			"Authorization":         "Bearer $TOKEN$",
 			"x-xai-token-auth":      "xai-grok-cli",
@@ -315,6 +336,34 @@ var usageSources = map[string]usageSource{
 		},
 		read: readGrokUsage,
 	},
+	// A Google subscription, signed in as Antigravity. Google's daily hosts at times answer
+	// with only some of the account's groups of models, without Gemini's: the production host
+	// then has the rest.
+	"antigravity": {
+		urls: []string{
+			"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+			"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+			"https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+		},
+		header: map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+			"Content-Type":  "application/json",
+			"User-Agent":    "antigravity/hub/2.23.0 darwin/arm64",
+		},
+		body: antigravityProject,
+		read: readAntigravityUsage,
+	},
+}
+
+// antigravityProject is the body of a Google account's quota request: the Google Cloud
+// project the proxy found for the account when it was signed in.
+func antigravityProject(auth *coreauth.Auth) (string, error) {
+	project, _ := auth.Metadata["project_id"].(string)
+	if strings.TrimSpace(project) == "" {
+		return "", errText("the account has no Google Cloud project, which its quota is asked for")
+	}
+	body, err := json.Marshal(map[string]string{"project": project})
+	return string(body), err
 }
 
 func (p *Pool) askUsage(ctx context.Context, auth *coreauth.Auth, source usageSource) (usagePage, error) {
@@ -325,9 +374,39 @@ func (p *Pool) askUsage(ctx context.Context, auth *coreauth.Auth, source usageSo
 	request := map[string]any{
 		"auth_index": auth.EnsureIndex(),
 		"method":     "GET",
-		"url":        source.url,
 		"header":     header,
 	}
+	if source.body != nil {
+		body, err := source.body(auth)
+		if err != nil {
+			return usagePage{}, err
+		}
+		request["method"], request["data"] = "POST", body
+	}
+	var (
+		page   usagePage
+		read   bool
+		failed error
+	)
+	for _, address := range source.urls {
+		request["url"] = address
+		answer, err := p.askUsageAt(ctx, request, source.read)
+		if err != nil {
+			failed = err
+			continue
+		}
+		page, read = page.with(answer), true
+		if page.hasUsed {
+			break
+		}
+	}
+	if !read {
+		return usagePage{}, failed
+	}
+	return page, nil
+}
+
+func (p *Pool) askUsageAt(ctx context.Context, request map[string]any, read func(body []byte) (usagePage, error)) (usagePage, error) {
 	var answer struct {
 		StatusCode int    `json:"status_code"`
 		Body       string `json:"body"`
@@ -338,7 +417,7 @@ func (p *Pool) askUsage(ctx context.Context, auth *coreauth.Auth, source usageSo
 	if answer.StatusCode != 200 {
 		return usagePage{}, errStatus("it", answer.StatusCode)
 	}
-	return source.read([]byte(answer.Body))
+	return read([]byte(answer.Body))
 }
 
 // A page that does not look like a usage page is an error, not a page that names nothing:
@@ -480,6 +559,73 @@ func readGrokUsage(body []byte) (usagePage, error) {
 	if at, err := time.Parse(time.RFC3339Nano, raw.Config.CurrentPeriod.End); err == nil {
 		page.reset = at
 	}
+	return page, nil
+}
+
+type antigravityBucket struct {
+	BucketID string `json:"bucketId"`
+	Window   string `json:"window"`
+	// RemainingFraction is what is left of the window, 0 to 1. A bucket without it says
+	// nothing.
+	RemainingFraction json.Number `json:"remainingFraction"`
+	ResetTime         string      `json:"resetTime"`
+}
+
+// readAntigravityUsage reads Google's quota summary of a Google account. Google keeps the
+// quota in groups of models, each with windows of its own: "Gemini Models" and "Claude and GPT
+// models", each with a five-hour and a weekly window. The account's week is its Gemini models'
+// weekly window, which is what a Google subscription is shared for. The weekly window of each
+// other group is a limit of those models, as Claude's for Fable is.
+func readAntigravityUsage(body []byte) (usagePage, error) {
+	var raw struct {
+		Groups []struct {
+			DisplayName string              `json:"displayName"`
+			Buckets     []antigravityBucket `json:"buckets"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return usagePage{}, errNotUsagePage
+	}
+	var page usagePage
+	for _, group := range raw.Groups {
+		gemini := strings.Contains(strings.ToLower(group.DisplayName), "gemini")
+		var (
+			week *antigravityBucket
+			left float64
+		)
+		for i, bucket := range group.Buckets {
+			gemini = gemini || strings.HasPrefix(strings.ToLower(bucket.BucketID), "gemini-")
+			window := strings.ToLower(strings.TrimSpace(bucket.Window))
+			if week != nil || (window != "weekly" && window != "week") {
+				continue
+			}
+			if fraction, err := bucket.RemainingFraction.Float64(); err == nil {
+				week, left = &group.Buckets[i], fraction
+			}
+		}
+		if week == nil {
+			continue
+		}
+		used := min(max(1-left, 0), 1)
+		reset, _ := time.Parse(time.RFC3339Nano, week.ResetTime)
+		if gemini {
+			if !page.hasUsed {
+				page.used, page.hasUsed, page.reset = used, true, reset
+			}
+			continue
+		}
+		name := strings.TrimSpace(group.DisplayName)
+		if name == "" {
+			continue
+		}
+		limit := ModelLimit{Model: name, Used: used}
+		if !reset.IsZero() {
+			at := reset.UTC()
+			limit.ResetAt = &at
+		}
+		page.models = append(page.models, limit)
+	}
+	slices.SortStableFunc(page.models, func(a, b ModelLimit) int { return strings.Compare(a.Model, b.Model) })
 	return page, nil
 }
 

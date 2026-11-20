@@ -13,13 +13,16 @@ import (
 // management API does the work; the pool starts it, passes on what the person brings back,
 // and gives the new account its owner and rule.
 //
-//   - Claude and Codex: the provider's page ends at an address on the person's own computer
-//     that nothing answers. They copy that address from their browser, and the site hands it
-//     to SigninCallback.
+//   - Claude, Codex and Google: the provider's page ends at an address on the person's own
+//     computer that nothing answers. They copy that address from their browser, and the site
+//     hands it to SigninCallback.
 //   - Grok: the provider's page asks for a code the proxy made. Nothing comes back by hand.
+//
+// A Google subscription is signed in the way Antigravity, Google's coding agent, signs in:
+// upstream has no other way for a Google subscription since it dropped Gemini CLI's.
 
 // Providers a subscription can be added for.
-var signinProviders = map[string]bool{"claude": true, "codex": true, "xai": true}
+var signinProviders = map[string]bool{"claude": true, "codex": true, "xai": true, "antigravity": true}
 
 // A sign-in that is not finished after this long is forgotten.
 const signinLifetime = 20 * time.Minute
@@ -75,7 +78,7 @@ type SigninStart struct {
 }
 
 var (
-	errUnknownProvider = errors.New("provider has to be claude, codex or xai")
+	errUnknownProvider = errors.New("provider has to be claude, codex, xai or antigravity")
 	errUnknownSignin   = errors.New("there is no such sign-in, or it has run out")
 )
 
