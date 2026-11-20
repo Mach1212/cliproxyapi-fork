@@ -571,11 +571,24 @@ type antigravityBucket struct {
 	ResetTime         string      `json:"resetTime"`
 }
 
+// weekly is the share of a weekly window that is used, and when it starts over. It is false
+// for a window of another length, and for one that does not say what is left.
+func (b antigravityBucket) weekly() (float64, time.Time, bool) {
+	window := strings.ToLower(strings.TrimSpace(b.Window))
+	left, err := b.RemainingFraction.Float64()
+	if (window != "weekly" && window != "week") || err != nil {
+		return 0, time.Time{}, false
+	}
+	reset, _ := time.Parse(time.RFC3339Nano, b.ResetTime)
+	return min(max(1-left, 0), 1), reset, true
+}
+
 // readAntigravityUsage reads Google's quota summary of a Google account. Google keeps the
 // quota in groups of models, each with windows of its own: "Gemini Models" and "Claude and GPT
-// models", each with a five-hour and a weekly window. The account's week is its Gemini models'
-// weekly window, which is what a Google subscription is shared for. The weekly window of each
-// other group is a limit of those models, as Claude's for Fable is.
+// models" each have a five-hour and a weekly window, and on a Pro plan "Gemini 4 Argon" has a
+// weekly window of its own. The account's week is the Gemini models' weekly window, which
+// Google calls gemini-weekly: it is what a Google subscription is shared for. The weekly window
+// of each other group is a limit of those models, as Claude's for Fable is.
 func readAntigravityUsage(body []byte) (usagePage, error) {
 	var raw struct {
 		Groups []struct {
@@ -588,42 +601,35 @@ func readAntigravityUsage(body []byte) (usagePage, error) {
 	}
 	var page usagePage
 	for _, group := range raw.Groups {
-		gemini := strings.Contains(strings.ToLower(group.DisplayName), "gemini")
 		var (
-			week *antigravityBucket
-			left float64
+			gemini, other     bool
+			used, otherUsed   float64
+			reset, otherReset time.Time
 		)
-		for i, bucket := range group.Buckets {
-			gemini = gemini || strings.HasPrefix(strings.ToLower(bucket.BucketID), "gemini-")
-			window := strings.ToLower(strings.TrimSpace(bucket.Window))
-			if week != nil || (window != "weekly" && window != "week") {
-				continue
-			}
-			if fraction, err := bucket.RemainingFraction.Float64(); err == nil {
-				week, left = &group.Buckets[i], fraction
+		for _, bucket := range group.Buckets {
+			u, at, ok := bucket.weekly()
+			switch {
+			case !ok:
+			case strings.EqualFold(bucket.BucketID, "gemini-weekly"):
+				gemini, used, reset = true, u, at
+			case !other:
+				other, otherUsed, otherReset = true, u, at
 			}
 		}
-		if week == nil {
-			continue
-		}
-		used := min(max(1-left, 0), 1)
-		reset, _ := time.Parse(time.RFC3339Nano, week.ResetTime)
-		if gemini {
+		name := strings.TrimSpace(group.DisplayName)
+		switch {
+		case gemini:
 			if !page.hasUsed {
 				page.used, page.hasUsed, page.reset = used, true, reset
 			}
-			continue
+		case other && name != "":
+			limit := ModelLimit{Model: name, Used: otherUsed}
+			if !otherReset.IsZero() {
+				at := otherReset.UTC()
+				limit.ResetAt = &at
+			}
+			page.models = append(page.models, limit)
 		}
-		name := strings.TrimSpace(group.DisplayName)
-		if name == "" {
-			continue
-		}
-		limit := ModelLimit{Model: name, Used: used}
-		if !reset.IsZero() {
-			at := reset.UTC()
-			limit.ResetAt = &at
-		}
-		page.models = append(page.models, limit)
 	}
 	slices.SortStableFunc(page.models, func(a, b ModelLimit) int { return strings.Compare(a.Model, b.Model) })
 	return page, nil

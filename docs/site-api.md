@@ -73,8 +73,8 @@ named they are nobody's, and use only what is shared with everyone.
   `model`, the provider's display name, `used`, a share from 0 to 1, and `reset_at`,
   an RFC 3339 time or `null` when unknown. Claude reports its weekly limits for individual
   models, such as Fable, whether the provider marks the limit active or inactive. Google
-  reports the weekly window of each of its other groups of models, named as Google names the
-  group, such as `Claude and GPT models`.
+  reports the weekly window of each of its groups of models besides Gemini's, named as Google
+  names the group: `Claude and GPT models`, and on a Pro plan `Gemini 4 Argon`.
   Entries are sorted by model name and dropped once their reset has passed.
 
 ### The rule

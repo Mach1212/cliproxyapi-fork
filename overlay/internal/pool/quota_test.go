@@ -78,7 +78,8 @@ func TestUsagePagesReportWeeklyFigures(t *testing.T) {
 		{"google without gemini", "antigravity", `{"groups":[{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.5}]}]}`, 0, false, "", false},
 		{"google five hours only", "antigravity", `{"groups":[{"displayName":"Gemini Models","buckets":[{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.5}]}]}`, 0, false, "", false},
 		{"google fraction missing", "antigravity", `{"groups":[{"displayName":"Gemini Models","buckets":[{"bucketId":"gemini-weekly","window":"weekly","resetTime":"2026-11-19T19:29:48Z"}]}]}`, 0, false, "", false},
-		{"google first week without fraction", "antigravity", `{"groups":[{"displayName":"Gemini Models","buckets":[{"bucketId":"gemini-weekly","window":"weekly"},{"bucketId":"gemini-weekly-2","window":"weekly","resetTime":"2026-11-19T19:29:48Z","remainingFraction":0.75}]}]}`, .25, true, "2026-11-19T19:29:48Z", false},
+		{"google argon before gemini", "antigravity", `{"groups":[{"displayName":"Gemini 4 Argon","buckets":[{"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","window":"weekly","resetTime":"2026-11-18T08:00:00Z","remainingFraction":0.5}]},{"displayName":"Gemini Models","buckets":[{"bucketId":"gemini-weekly","window":"weekly","resetTime":"2026-11-19T19:29:48Z","remainingFraction":0.75}]}]}`, .25, true, "2026-11-19T19:29:48Z", false},
+		{"google argon only", "antigravity", `{"groups":[{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-weekly","window":"weekly","remainingFraction":0.5}]},{"displayName":"Gemini 4 Argon","buckets":[{"bucketId":"gemini-argon-wtu-weekly","window":"weekly","remainingFraction":0.5}]}]}`, 0, false, "", false},
 		{"google no groups", "antigravity", `{}`, 0, false, "", false},
 		{"malformed claude", "claude", `{`, 0, false, "", true},
 		{"malformed codex", "codex", `{`, 0, false, "", true},
@@ -126,9 +127,11 @@ func TestClaudeModelLimitsKeepNamedNumericWeeklyScopes(t *testing.T) {
 }
 
 func TestGoogleModelLimitsAreTheWeeksOfItsOtherGroups(t *testing.T) {
+	// The groups as Google answers for a Pro plan, with what is left made up.
 	page, err := readAntigravityUsage([]byte(`{"groups":[
-		{"displayName":"Gemini Models","buckets":[{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.75}]},
-		{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-5h","window":"5h","remainingFraction":0.125},{"bucketId":"3p-weekly","window":"weekly","resetTime":"2026-11-18T08:00:00Z","remainingFraction":0.5}]},
+		{"displayName":"Gemini Models","description":"Models within this group: Gemini 4 Neon, Gemini 4 Hydrogen, Gemini 3.8 Flash","buckets":[{"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":0.75,"resetTime":"2026-11-27T18:48:07Z"},{"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining","window":"5h","remainingFraction":0.5,"resetTime":"2026-11-20T23:48:07Z"}]},
+		{"displayName":"Claude and GPT models","description":"Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B","buckets":[{"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":0.5,"resetTime":"2026-11-27T18:48:07Z"},{"bucketId":"3p-5h","displayName":"Five Hour Limit Remaining","window":"5h","remainingFraction":0.125,"resetTime":"2026-11-20T23:48:07Z"}]},
+		{"displayName":"Gemini 4 Argon","description":"For paid Pro plans, Argon quota is separate.","buckets":[{"bucketId":"gemini-argon-wtu-weekly","displayName":"Gemini 4 Argon Weekly Limit","window":"weekly","remainingFraction":0.25}]},
 		{"displayName":"Image models","buckets":[{"bucketId":"image-weekly","window":"weekly","remainingFraction":1.5}]},
 		{"displayName":"Five hours only","buckets":[{"bucketId":"x-5h","window":"5h","remainingFraction":0.5}]},
 		{"displayName":" ","buckets":[{"bucketId":"y-weekly","window":"weekly","remainingFraction":0.5}]}
@@ -136,8 +139,11 @@ func TestGoogleModelLimitsAreTheWeeksOfItsOtherGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	at := time.Date(2026, 11, 18, 8, 0, 0, 0, time.UTC)
-	want := []ModelLimit{{Model: "Claude and GPT models", Used: .5, ResetAt: &at}, {Model: "Image models", Used: 0}}
+	if page.used != .25 || !page.hasUsed || !page.reset.Equal(time.Date(2026, 11, 27, 18, 48, 7, 0, time.UTC)) {
+		t.Errorf("week: %v %v %v", page.used, page.hasUsed, page.reset)
+	}
+	at := time.Date(2026, 11, 27, 18, 48, 7, 0, time.UTC)
+	want := []ModelLimit{{Model: "Claude and GPT models", Used: .5, ResetAt: &at}, {Model: "Gemini 4 Argon", Used: .75}, {Model: "Image models", Used: 0}}
 	if !reflect.DeepEqual(page.models, want) {
 		t.Errorf("model limits: %+v; want %+v", page.models, want)
 	}
@@ -159,9 +165,9 @@ func TestGoogleUsageAsksGooglesHostsInTurnUntilOneHasGemini(t *testing.T) {
 	}
 	hosts := usageSources["antigravity"].urls
 	full := `{"groups":[{"displayName":"Gemini Models","buckets":[{"bucketId":"gemini-weekly","window":"weekly","resetTime":"2026-11-19T19:29:48Z","remainingFraction":0.75}]},{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-weekly","window":"weekly","resetTime":"2026-11-18T08:00:00Z","remainingFraction":0.25}]}]}`
-	// The daily host leaves Gemini's group out, the sandbox host answers nothing the pool can
-	// read, and the production host has it all.
-	pages.pages[hosts[0]] = `{"groups":[{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-weekly","window":"weekly","resetTime":"2026-11-18T08:00:00Z","remainingFraction":0.5}]}]}`
+	// The daily host leaves Gemini's group out (Argon's is not it), the sandbox host answers
+	// nothing the pool can read, and the production host has it all.
+	pages.pages[hosts[0]] = `{"groups":[{"displayName":"Claude and GPT models","buckets":[{"bucketId":"3p-weekly","window":"weekly","resetTime":"2026-11-18T08:00:00Z","remainingFraction":0.5}]},{"displayName":"Gemini 4 Argon","buckets":[{"bucketId":"gemini-argon-wtu-weekly","window":"weekly","resetTime":"2026-11-18T08:00:00Z","remainingFraction":0.5}]}]}`
 	pages.pages[hosts[2]] = full
 	p.now = func() time.Time { return testNow.Add(probeWait) }
 	p.readUsagePages(context.Background())
@@ -181,7 +187,7 @@ func TestGoogleUsageAsksGooglesHostsInTurnUntilOneHasGemini(t *testing.T) {
 	}
 	// What the first host said of a group stays.
 	at := time.Date(2026, 11, 18, 8, 0, 0, 0, time.UTC)
-	if want := []ModelLimit{{Model: "Claude and GPT models", Used: .5, ResetAt: &at}}; !reflect.DeepEqual(sub.ModelLimits, want) {
+	if want := []ModelLimit{{Model: "Claude and GPT models", Used: .5, ResetAt: &at}, {Model: "Gemini 4 Argon", Used: .5, ResetAt: &at}}; !reflect.DeepEqual(sub.ModelLimits, want) {
 		t.Errorf("model limits: %+v; want %+v", sub.ModelLimits, want)
 	}
 
