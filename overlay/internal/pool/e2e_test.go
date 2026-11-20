@@ -280,8 +280,15 @@ api-keys:
 		ready := false
 		if response, err := http.Get(e.site + "/pool/v1/health"); err == nil {
 			response.Body.Close()
-			if status, _, _ := e.do(e.proxy, "legacy-key", "GET", "/v1/models", ""); status == http.StatusOK {
-				ready = true
+			// The site API can answer before the proxy listens. That is not up yet, not a failure.
+			request, err := http.NewRequest(http.MethodGet, e.proxy+"/v1/models", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Authorization", "Bearer legacy-key")
+			if response, err := http.DefaultClient.Do(request); err == nil {
+				response.Body.Close()
+				ready = response.StatusCode == http.StatusOK
 			}
 		}
 		if ready {
