@@ -143,6 +143,12 @@ the new account has the rule the sign-in was started with, and the sign-in is fo
 `DELETE /pool/v1/signins/{state}` gives it up. A sign-in not finished in 20 minutes is
 forgotten.
 
+The proxy names the account it saved only for Codex and for an account signed in again. For
+the others the pool takes the account of that provider that was not there when the sign-in
+started. When it cannot tell which one that is within a minute of the proxy saving it (an
+account that is in the pool already, or two added at once), the sign-in ends with an error
+and no account gets its rule.
+
 ## Usage
 
 `GET /pool/v1/usage` answers every count there is, newest week first:

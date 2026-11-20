@@ -679,6 +679,88 @@ func TestAGoogleSubscriptionIsSignedInAsAntigravity(t *testing.T) {
 	}
 }
 
+func TestASignInTheProxyDoesNotNameGetsTheAccountThatIsNew(t *testing.T) {
+	// Upstream names the account it saved only for Codex and for an account signed in again.
+	var states, statusCalls int
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/auth-url":
+			states++
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "url": "https://accounts.google.com/o/oauth2/v2/auth", "state": "G" + strconv.Itoa(states)})
+		case "/oauth/status":
+			statusCalls++
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer management.Close()
+	p := newTestPool(t, account{id: "antigravity-old.json", provider: "antigravity"})
+	p.cfg.ManagementURL, p.cfg.ManagementKeyFile = management.URL, p.cfg.SiteKeyFile
+	ctx := context.Background()
+	register := func(id, provider string) {
+		t.Helper()
+		if _, err := p.manager.Register(ctx, &coreauth.Auth{ID: id, Provider: provider, Status: coreauth.StatusActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start, err := p.startSignin(ctx, "antigravity", "", Rule{Owner: "ada"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Saved, but not among the accounts yet.
+	if status, err := p.signinStatus(ctx, start.State); err != nil || status.Status != "wait" {
+		t.Fatalf("before the account is there: %+v, %v", status, err)
+	}
+	register("claude-new.json", "claude")
+	register("antigravity-new.json", "antigravity")
+	status, err := p.signinStatus(ctx, start.State)
+	if err != nil || status.Status != "ok" || status.Subscription != "antigravity-new.json" {
+		t.Fatalf("once it is there: %+v, %v", status, err)
+	}
+	if got := p.state.rule("antigravity-new.json"); got.Owner != "ada" {
+		t.Errorf("the new account's rule: %+v", got)
+	}
+	if got := p.state.rule("antigravity-old.json"); got.Owner != "" {
+		t.Errorf("the account that was there before got a rule: %+v", got)
+	}
+	if statusCalls != 1 {
+		t.Errorf("the proxy was asked %d times; once it has saved the account it forgets the sign-in within a minute", statusCalls)
+	}
+
+	// An account the pool has already, added again: nothing is new. After a minute the sign-in
+	// says so, and no account gets its rule.
+	again, err := p.startSignin(ctx, "antigravity", "", Rule{Owner: "grace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, err := p.signinStatus(ctx, again.State); err != nil || status.Status != "wait" {
+		t.Fatalf("within the minute: %+v, %v", status, err)
+	}
+	p.now = func() time.Time { return testNow.Add(signinSettle) }
+	if status, err := p.signinStatus(ctx, again.State); err != nil || status.Status != "error" || !strings.Contains(status.Error, "in the pool already") {
+		t.Fatalf("after the minute: %+v, %v", status, err)
+	}
+	for _, id := range []string{"antigravity-old.json", "antigravity-new.json"} {
+		if got := p.state.rule(id); got.Owner == "grace" {
+			t.Errorf("%s got the rule of a sign-in that did not make it", id)
+		}
+	}
+
+	// A subscription signed in again is the one it names, and keeps its rule.
+	renewed, err := p.startSignin(ctx, "antigravity", "antigravity-new.json", Rule{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, err := p.signinStatus(ctx, renewed.State); err != nil || status.Status != "ok" || status.Subscription != "antigravity-new.json" {
+		t.Fatalf("signed in again: %+v, %v", status, err)
+	}
+	if got := p.state.rule("antigravity-new.json"); got.Owner != "ada" {
+		t.Errorf("the rule after signing in again: %+v", got)
+	}
+}
+
 func TestAnAccountThatRefusesTheModelIsAskedLast(t *testing.T) {
 	near := claude("near.json", 0.86, 5*time.Hour)
 	near.refuses = map[string]time.Duration{"claude-fable-5-2": 5 * time.Hour}

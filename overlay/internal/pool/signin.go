@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,13 +25,25 @@ import (
 // Providers a subscription can be added for.
 var signinProviders = map[string]bool{"claude": true, "codex": true, "xai": true, "antigravity": true}
 
-// A sign-in that is not finished after this long is forgotten.
-const signinLifetime = 20 * time.Minute
+const (
+	// A sign-in that is not finished after this long is forgotten.
+	signinLifetime = 20 * time.Minute
+	// How long after the proxy has saved an account it did not name the pool looks for it.
+	signinSettle = time.Minute
+)
 
 type pendingSignin struct {
 	provider string
 	rule     Rule
 	started  time.Time
+	// subscription is the account signed in again, empty for a new one.
+	subscription string
+	// had are the provider's accounts when the sign-in started. The proxy names the account
+	// it saved only for Codex and for an account signed in again; a new account of the other
+	// providers is the one that was not there before.
+	had map[string]bool
+	// saved is when the proxy said it saved an account it did not name, zero until then.
+	saved time.Time
 }
 
 type signins struct {
@@ -62,6 +75,15 @@ func (s *signins) remove(state string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.pending, state)
+}
+
+func (s *signins) markSaved(state string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if signin, ok := s.pending[state]; ok {
+		signin.saved = at
+		s.pending[state] = signin
+	}
 }
 
 // SigninStart is what the person needs to sign in.
@@ -108,7 +130,13 @@ func (p *Pool) startSignin(ctx context.Context, provider, subscription string, r
 	if subscription != "" {
 		rule = p.state.rule(subscription)
 	}
-	p.signins.add(answer.State, pendingSignin{provider: provider, rule: rule, started: p.now()})
+	had := map[string]bool{}
+	for _, auth := range p.manager.List() {
+		if auth != nil && strings.EqualFold(auth.Provider, provider) {
+			had[auth.ID] = true
+		}
+	}
+	p.signins.add(answer.State, pendingSignin{provider: provider, rule: rule, started: p.now(), subscription: subscription, had: had})
 	start := SigninStart{State: answer.State, URL: answer.URL, Flow: "paste", ExpiresIn: answer.ExpiresIn}
 	if answer.Flow == "device" {
 		start.Flow, start.UserCode = "code", answer.UserCode
@@ -147,30 +175,67 @@ func (p *Pool) signinStatus(ctx context.Context, state string) (SigninStatus, er
 	if !ok {
 		return SigninStatus{}, errUnknownSignin
 	}
-	var answer struct {
-		Status string `json:"status"`
-		AuthID string `json:"auth_id"`
-		Error  string `json:"error"`
-	}
-	if err := p.management(ctx, http.MethodGet, "/oauth/status?state="+url.QueryEscape(state), nil, &answer); err != nil {
-		return SigninStatus{}, err
-	}
-	switch answer.Status {
-	case "ok":
-		if answer.AuthID == "" {
-			return SigninStatus{}, errText("the proxy finished the sign-in without naming the account")
+	// The proxy forgets a finished sign-in a minute after it saved the account, so once it has
+	// said so, it is not asked again.
+	if signin.saved.IsZero() {
+		var answer struct {
+			Status string `json:"status"`
+			AuthID string `json:"auth_id"`
+			Error  string `json:"error"`
 		}
-		if err := p.state.setRule(answer.AuthID, signin.rule); err != nil {
+		if err := p.management(ctx, http.MethodGet, "/oauth/status?state="+url.QueryEscape(state), nil, &answer); err != nil {
 			return SigninStatus{}, err
 		}
-		p.signins.remove(state)
-		return SigninStatus{Status: "ok", Subscription: answer.AuthID}, nil
-	case "error":
-		p.signins.remove(state)
-		return SigninStatus{Status: "error", Error: answer.Error}, nil
-	default:
+		switch answer.Status {
+		case "ok":
+			if answer.AuthID != "" {
+				return p.signedIn(state, signin, answer.AuthID)
+			}
+			signin.saved = p.now()
+			p.signins.markSaved(state, signin.saved)
+		case "error":
+			p.signins.remove(state)
+			return SigninStatus{Status: "error", Error: answer.Error}, nil
+		default:
+			return SigninStatus{Status: "wait"}, nil
+		}
+	}
+	if signin.subscription != "" {
+		return p.signedIn(state, signin, signin.subscription)
+	}
+	// The account may take a moment to join the pool after the proxy saved it.
+	if id, ok := p.newAccount(signin); ok {
+		return p.signedIn(state, signin, id)
+	}
+	if p.now().Sub(signin.saved) < signinSettle {
 		return SigninStatus{Status: "wait"}, nil
 	}
+	p.signins.remove(state)
+	return SigninStatus{Status: "error", Error: "the proxy saved the login, but the pool cannot tell which subscription it is: it may be in the pool already"}, nil
+}
+
+// newAccount is the account a new sign-in made: the one of its provider that was not there
+// when the sign-in started. Two of them would leave it unknown which is this sign-in's.
+func (p *Pool) newAccount(signin pendingSignin) (string, bool) {
+	var found []string
+	for _, auth := range p.manager.List() {
+		if auth != nil && strings.EqualFold(auth.Provider, signin.provider) && !signin.had[auth.ID] {
+			found = append(found, auth.ID)
+		}
+	}
+	if len(found) != 1 {
+		return "", false
+	}
+	return found[0], true
+}
+
+// signedIn gives the account the sign-in's rule and forgets the sign-in.
+func (p *Pool) signedIn(state string, signin pendingSignin, id string) (SigninStatus, error) {
+	if err := p.state.setRule(id, signin.rule); err != nil {
+		return SigninStatus{}, err
+	}
+	p.signins.remove(state)
+	return SigninStatus{Status: "ok", Subscription: id}, nil
 }
 
 func (p *Pool) cancelSignin(ctx context.Context, state string) error {
