@@ -87,6 +87,7 @@ named they are nobody's, and use only what is shared with everyone.
 | `share` | `everyone` (also when empty), `people`, or `private`. |
 | `people` | Who may use it when `share` is `people`. |
 | `reserve_percent` | 0 to 100. The others are refused once the subscription's weekly usage reaches 100 minus this. |
+| `fable_reserve_percent` | 0 to 100. The others are refused the Fable models (`claude-fable-*`, matched as `blocked_models` are) once the subscription's `Fable` limit in `model_limits` reaches 100 minus this. It does nothing while that limit is not known. |
 | `blocked_models` | Patterns of model names the others may not use, with `*` for any run of characters: `claude-fable-*`. Matched without regard to case, an account prefix (`team/model`) or a thinking suffix (`model(high)`). A model released later is blocked as soon as its name matches. |
 | `block_fast_mode` | The others' requests run at normal speed: the fast setting is taken off the request (Claude's `speed`, Codex's `service_tier`). Grok's fast mode is a model of its own, named `…-fast`; those are refused. |
 
@@ -108,7 +109,7 @@ When none is left, the request is refused with a message that says why:
 
 | status | `code` | when |
 |---|---|---|
-| 429 | `pool_reserve_reached` | the owners' reserves are reached; the message names the next reset |
+| 429 | `pool_reserve_reached` | the owners' reserves are reached, of the week or of Fable; the message says which, and names the next reset |
 | 403 | `pool_model_blocked` | the model is blocked on every subscription the person may use |
 | 403 | `pool_fast_mode_blocked` | a Grok fast model, where fast mode is off |
 | 403 | `pool_not_shared` | no subscription for the model is shared with the person |

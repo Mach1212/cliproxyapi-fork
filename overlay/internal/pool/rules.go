@@ -27,6 +27,9 @@ type Rule struct {
 	// ReservePercent of the week is kept for the owner: the others are refused once the
 	// subscription's weekly usage reaches 100 minus this.
 	ReservePercent int `json:"reserve_percent"`
+	// FableReservePercent of a Claude subscription's Fable limit is kept for the owner: the
+	// others are refused the Fable models once that limit's usage reaches 100 minus this.
+	FableReservePercent int `json:"fable_reserve_percent"`
 	// BlockedModels are patterns of model names the others may not use, such as
 	// "claude-fable-*". A model released later is blocked as soon as its name matches.
 	BlockedModels []string `json:"blocked_models,omitempty"`
@@ -42,6 +45,9 @@ func (r Rule) validate() error {
 	}
 	if r.ReservePercent < 0 || r.ReservePercent > 100 {
 		return fmt.Errorf("reserve_percent is %d, it has to be between 0 and 100", r.ReservePercent)
+	}
+	if r.FableReservePercent < 0 || r.FableReservePercent > 100 {
+		return fmt.Errorf("fable_reserve_percent is %d, it has to be between 0 and 100", r.FableReservePercent)
 	}
 	for _, pattern := range r.BlockedModels {
 		if strings.TrimSpace(pattern) == "" {
@@ -63,7 +69,27 @@ const (
 	deniedModel
 	deniedFastModel
 	deniedReserve
+	deniedFableReserve
 )
+
+// fableModels are the models that count against Claude's Fable limit.
+const fableModels = "claude-fable-*"
+
+func isFableModel(model string) bool {
+	ok, _ := path.Match(fableModels, modelName(model))
+	return ok
+}
+
+// fableLimit is the Fable limit among an account's limits of single models. Claude names it
+// "Fable"; the case of the name is not relied on.
+func fableLimit(limits []ModelLimit) (ModelLimit, bool) {
+	for _, limit := range limits {
+		if strings.EqualFold(limit.Model, "Fable") {
+			return limit, true
+		}
+	}
+	return ModelLimit{}, false
+}
 
 // modelName is the name a rule's patterns are matched against: lower case, without an
 // account prefix ("team/model") and without a thinking suffix ("model(high)").
@@ -98,8 +124,9 @@ func isFastModel(provider, model string) bool {
 }
 
 // decide tells whether the subscription serves this person's request. An empty person is
-// someone the pool does not know, who is nobody's owner.
-func (r Rule) decide(person, provider string, models []string, week Weekly) denial {
+// someone the pool does not know, who is nobody's owner. limits are the account's limits of
+// single models; only a Fable reserve needs them.
+func (r Rule) decide(person, provider string, models []string, week Weekly, limits []ModelLimit) denial {
 	if person != "" && person == r.Owner {
 		return allowed
 	}
@@ -121,6 +148,11 @@ func (r Rule) decide(person, provider string, models []string, week Weekly) deni
 	}
 	if r.ReservePercent > 0 && week.UsedKnown && week.Used*100 >= float64(100-r.ReservePercent) {
 		return deniedReserve
+	}
+	if r.FableReservePercent > 0 && slices.ContainsFunc(models, isFableModel) {
+		if fable, ok := fableLimit(limits); ok && fable.Used*100 >= float64(100-r.FableReservePercent) {
+			return deniedFableReserve
+		}
 	}
 	return allowed
 }

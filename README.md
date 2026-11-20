@@ -9,7 +9,8 @@ What the pool adds:
 - **Tokens that belong to a person.** The proxy knows who a request is from, and keeps the
   person's id where it would otherwise keep the key.
 - **A rule per subscription**, set by its owner: who may use it, the share of the week kept
-  for the owner, blocked models, fast mode. The rule binds everyone but the owner.
+  for the owner, the share of Claude's Fable limit kept for the owner, blocked models, fast
+  mode. The rule binds everyone but the owner.
 - **Which subscription serves a request:** of those the person may use, the one whose weekly
   reset is closest, whoever owns it.
 - **Usage figures** per person, model and subscription, by week.

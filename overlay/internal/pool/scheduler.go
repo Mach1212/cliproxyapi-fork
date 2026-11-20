@@ -67,7 +67,13 @@ func (s *scheduler) PickAuth(ctx context.Context, req pluginapi.SchedulerPickReq
 
 	eligible := make([]candidate, 0, len(req.Candidates))
 	denials := map[denial]int{}
-	var soonest time.Time
+	// When the reserves that turned the person away start over, the soonest of each kind.
+	soonest := map[denial]time.Time{}
+	keepSoonest := func(why denial, at time.Time) {
+		if !at.IsZero() && (soonest[why].IsZero() || at.Before(soonest[why])) {
+			soonest[why] = at
+		}
+	}
 	for _, offered := range req.Candidates {
 		auth, ok := p.manager.GetByID(offered.ID)
 		if !ok || auth == nil {
@@ -75,10 +81,20 @@ func (s *scheduler) PickAuth(ctx context.Context, req pluginapi.SchedulerPickReq
 		}
 		week := p.weeklyOf(auth, now)
 		if !who.internal {
-			if why := p.state.rule(auth.ID).decide(who.person, auth.Provider, models, week); why != allowed {
+			rule := p.state.rule(auth.ID)
+			var limits []ModelLimit
+			if rule.FableReservePercent > 0 {
+				limits = p.probes.modelLimits(auth.ID, now)
+			}
+			if why := rule.decide(who.person, auth.Provider, models, week, limits); why != allowed {
 				denials[why]++
-				if why == deniedReserve && !week.ResetAt.IsZero() && (soonest.IsZero() || week.ResetAt.Before(soonest)) {
-					soonest = week.ResetAt
+				switch why {
+				case deniedReserve:
+					keepSoonest(why, week.ResetAt)
+				case deniedFableReserve:
+					if fable, ok := fableLimit(limits); ok && fable.ResetAt != nil {
+						keepSoonest(why, *fable.ResetAt)
+					}
 				}
 				continue
 			}
@@ -95,15 +111,13 @@ func (s *scheduler) PickAuth(ctx context.Context, req pluginapi.SchedulerPickReq
 
 // refusal is the answer to a request that no subscription may serve. It names the reason
 // that leaves the person the most to do about it.
-func refusal(model string, denials map[denial]int, soonest time.Time) error {
+func refusal(model string, denials map[denial]int, soonest map[denial]time.Time) error {
 	model = modelName(model)
 	switch {
 	case denials[deniedReserve] > 0:
-		message := fmt.Sprintf("The pooled subscriptions for %s have reached the share of this week that their owners keep for themselves.", model)
-		if !soonest.IsZero() {
-			message += " The next one starts over at " + soonest.UTC().Format("2006-01-02 15:04 MST") + "."
-		}
-		return &coreauth.Error{Code: "pool_reserve_reached", Message: message, HTTPStatus: http.StatusTooManyRequests}
+		return reserveReached(fmt.Sprintf("The pooled subscriptions for %s have reached the share of this week that their owners keep for themselves.", model), soonest[deniedReserve])
+	case denials[deniedFableReserve] > 0:
+		return reserveReached(fmt.Sprintf("The pooled subscriptions for %s have reached the share of their Fable limit that their owners keep for themselves.", model), soonest[deniedFableReserve])
 	case denials[deniedFastModel] > 0:
 		return &coreauth.Error{Code: "pool_fast_mode_blocked", Message: fmt.Sprintf("%s is a fast model, and the pooled subscriptions do not allow fast mode. Use the model without \"-fast\".", model), HTTPStatus: http.StatusForbidden}
 	case denials[deniedModel] > 0:
@@ -113,4 +127,13 @@ func refusal(model string, denials map[denial]int, soonest time.Time) error {
 	default:
 		return &coreauth.Error{Code: "auth_not_found", Message: "no auth available"}
 	}
+}
+
+// reserveReached refuses a request that only the owners' reserves stand in the way of, and
+// says when the first of them starts over, if that is known.
+func reserveReached(message string, soonest time.Time) error {
+	if !soonest.IsZero() {
+		message += " The next one starts over at " + soonest.UTC().Format("2006-01-02 15:04 MST") + "."
+	}
+	return &coreauth.Error{Code: "pool_reserve_reached", Message: message, HTTPStatus: http.StatusTooManyRequests}
 }

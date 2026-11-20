@@ -164,6 +164,59 @@ func TestAReserveKeepsTheRestOfTheWeekForTheOwner(t *testing.T) {
 	}
 }
 
+// fableUsed sets what an account's usage page says of its Fable limit.
+func fableUsed(p *Pool, id string, used float64, resetIn time.Duration) {
+	at := testNow.Add(resetIn)
+	p.probes.mu.Lock()
+	defer p.probes.mu.Unlock()
+	p.probes.entries[id] = &probe{read: true, page: usagePage{models: []ModelLimit{{Model: "Fable", Used: used, ResetAt: &at}}}}
+}
+
+func TestAFableReserveKeepsTheRestOfTheFableLimitForTheOwner(t *testing.T) {
+	p := newTestPool(t, claude("near.json", 0.30, 5*time.Hour), claude("far.json", 0.30, 6*24*time.Hour))
+	if err := p.state.setRule("near.json", Rule{Owner: "grace", FableReservePercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	fableUsed(p, "near.json", 0.80, 2*24*time.Hour)
+
+	// 80% of Fable used with 20% kept: the others' Fable goes to the next account, in every
+	// way a model's name is written.
+	for _, model := range []string{"claude-fable-5-2", "CLAUDE-FABLE-5-2", "team/claude-fable-5-2", "claude-fable-5-2(high)"} {
+		if got, err := pick(t, p, as("ada"), model, "near.json", "far.json"); err != nil || got != "far.json" {
+			t.Errorf("%s: got %q, %v; want far.json", model, got, err)
+		}
+	}
+	// Their other models still use it, and so does the owner's Fable.
+	if got, _ := pick(t, p, as("ada"), "claude-opus-5-5", "near.json", "far.json"); got != "near.json" {
+		t.Errorf("another model: got %q, want near.json", got)
+	}
+	if got, _ := pick(t, p, as("grace"), "claude-fable-5-2", "near.json", "far.json"); got != "near.json" {
+		t.Errorf("the owner: got %q, want near.json", got)
+	}
+
+	// With nothing else to use, the person is told why and until when.
+	_, err := pick(t, p, as("ada"), "claude-fable-5-2", "near.json")
+	if code, status := refusalCode(t, err); code != "pool_reserve_reached" || status != http.StatusTooManyRequests {
+		t.Fatalf("got %s %d", code, status)
+	}
+	if !strings.Contains(err.Error(), "Fable limit") || !strings.Contains(err.Error(), "2026-11-15 12:00 UTC") {
+		t.Fatalf("the refusal does not say it is Fable's, or when it starts over: %v", err)
+	}
+
+	// Just under the reserve it serves everyone, and so it does while the page has not said.
+	fableUsed(p, "near.json", 0.79, 2*24*time.Hour)
+	if got, err := pick(t, p, as("ada"), "claude-fable-5-2", "near.json"); err != nil || got != "near.json" {
+		t.Errorf("under the reserve: got %q, %v; want near.json", got, err)
+	}
+	unread := newTestPool(t, claude("near.json", 0.30, 5*time.Hour))
+	if err := unread.state.setRule("near.json", Rule{Owner: "grace", FableReservePercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := pick(t, unread, as("ada"), "claude-fable-5-2", "near.json"); err != nil || got != "near.json" {
+		t.Errorf("an unknown Fable limit: got %q, %v; want near.json", got, err)
+	}
+}
+
 func TestABlockedModelIsBlockedForTheOthersIncludingLaterVersions(t *testing.T) {
 	p := newTestPool(t, claude("a.json", 0.1, time.Hour), claude("b.json", 0.1, 2*time.Hour))
 	if err := p.state.setRule("a.json", Rule{Owner: "grace", BlockedModels: []string{"claude-fable-*"}}); err != nil {
@@ -524,16 +577,17 @@ func TestTheSiteAPI(t *testing.T) {
 		t.Errorf("the token list: %s", listed)
 	}
 
-	rule := `{"owner":"user_ada","share":"people","people":["user_grace"],"reserve_percent":20,"blocked_models":["claude-fable-*"],"block_fast_mode":true}`
+	rule := `{"owner":"user_ada","share":"people","people":["user_grace"],"reserve_percent":20,"fable_reserve_percent":30,"blocked_models":["claude-fable-*"],"block_fast_mode":true}`
 	if status, body := call(siteKey, "PUT", "/pool/v1/subscriptions/a.json/rule", rule); status != http.StatusOK {
 		t.Fatalf("setting a rule: %d %v", status, body)
 	}
-	if got := p.state.rule("a.json"); got.Owner != "user_ada" || got.ReservePercent != 20 || !got.BlockFastMode || got.People[0] != "user_grace" {
+	if got := p.state.rule("a.json"); got.Owner != "user_ada" || got.ReservePercent != 20 || got.FableReservePercent != 30 || !got.BlockFastMode || got.People[0] != "user_grace" {
 		t.Errorf("the rule that was kept: %+v", got)
 	}
 	for name, bad := range map[string]string{
 		"a share that does not exist": `{"share":"friends"}`,
 		"a reserve over 100":          `{"reserve_percent":120}`,
+		"a Fable reserve over 100":    `{"fable_reserve_percent":101}`,
 		"a broken pattern":            `{"blocked_models":["claude-["]}`,
 		"a field that does not exist": `{"owner":"x","admin":true}`,
 	} {
@@ -555,7 +609,7 @@ func TestTheSiteAPI(t *testing.T) {
 	if sub["id"] != "a.json" || sub["provider"] != "claude" || weekly["used"] != 0.5 || weekly["reset_at"] != "2026-11-14T18:00:00Z" {
 		t.Errorf("the subscription: %v", sub)
 	}
-	if sub["rule"].(map[string]any)["owner"] != "user_ada" {
+	if listed := sub["rule"].(map[string]any); listed["owner"] != "user_ada" || listed["fable_reserve_percent"] != 30.0 {
 		t.Errorf("the subscription's rule: %v", sub["rule"])
 	}
 
