@@ -1,7 +1,7 @@
 apiVersion: v2
 name: cliproxyapi
-description: CLIProxyAPI with the pool, behind a gate that drains before the proxy restarts
+description: CLIProxyAPI with the pool, behind a gate that holds requests while the proxy restarts
 type: application
-version: 0.1.0
+version: 0.2.0
 # The proxy's own version is the image's: the keeper keeps it at the fork's latest build.
 appVersion: "8"

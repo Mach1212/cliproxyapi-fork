@@ -1,15 +1,14 @@
 {{- /*
-The pod:
+The proxy's pod. The gate is a pod of its own (gate.yaml), so that the port clients reach
+stays open while this one restarts.
 - cliproxyapi: the proxy, on 127.0.0.1 only. Its management API answers there to the
-  management key, and the gate lets none of its paths through. With the pool on, the site
-  API listens on a port of its own, for the website alone.
-- gate: HAProxy, the only listener clients reach. HTTP/1 only; lets only /v1/ and /v1beta/
-  paths through after normalization; refuses any %-encoding; strips forwarded headers. Its
-  runtime API on 127.0.0.1:9999 drains it.
+  management key, and neither the relay nor the gate lets any of its paths through. With the
+  pool on, the site API listens on a port of its own, for the website alone.
+- relay: HAProxy, this pod's listener for the gate. It passes a request to the proxy on
+  loopback, under the gate's rules once more, and holds it while the proxy starts.
 - config-init, config-sync: copy the configuration out of the Secret into memory and keep
   the copy current by writing the file in place. The proxy misses the swap of a mounted
   Secret, but reloads on a write in place (about 60 to 90 s after the Secret changes).
-- keeper: follows the fork's releases. The only container with a token for the cluster.
 */ -}}
 {{- $name := include "cliproxyapi.fullname" . -}}
 {{- if and .Values.pool.enabled (not .Values.pool.siteKey.existingSecret) }}
@@ -27,18 +26,21 @@ spec:
   selector:
     matchLabels:
       {{- include "cliproxyapi.selector" . | nindent 6 }}
-  # One disk, and maybe a port of the node: the old pod has to be gone before the new one starts.
+  # One disk: the old pod has to be gone before the new one starts.
   strategy:
     type: Recreate
   template:
     metadata:
       labels:
         {{- include "cliproxyapi.selector" . | nindent 8 }}
+      annotations:
+        # The relay reads its configuration only when it starts.
+        checksum/relay: {{ include "cliproxyapi.relay.cfg" . | sha256sum }}
     spec:
-      {{- if .Values.keeper.enabled }}
-      serviceAccountName: {{ $name }}-keeper
-      {{- end }}
-      # Only the keeper container gets a token (projected below).
+      # Named, because a pod template that leaves the account out keeps the one it had: the
+      # keeper's, from when the gate and the keeper were in this pod. No container here has a
+      # token.
+      serviceAccountName: default
       automountServiceAccountToken: false
       enableServiceLinks: false
       {{- with .Values.imagePullSecrets }}
@@ -99,8 +101,6 @@ spec:
               containerPort: {{ .Values.pool.service.port }}
               protocol: TCP
           {{- end }}
-          # On the proxy's own port, not on the gate, so a drain does not make the pod
-          # NotReady while long answers finish.
           readinessProbe:
             exec:
               command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/{{ .Values.proxy.port }}"]
@@ -121,22 +121,19 @@ spec:
             - {name: site-key, mountPath: /etc/cliproxy-pool, readOnly: true}
             - {name: management-key, mountPath: /etc/cliproxy-management, readOnly: true}
             {{- end }}
-        - name: gate
+        - name: relay
           image: {{ .Values.haproxyImage }}
           imagePullPolicy: IfNotPresent
           ports:
-            - name: api
-              containerPort: {{ .Values.gate.port }}
-              {{- if .Values.gate.hostPort }}
-              hostPort: {{ .Values.gate.hostPort }}
-              {{- end }}
+            - name: relay
+              containerPort: {{ .Values.relay.port }}
               protocol: TCP
           resources:
-            {{- toYaml .Values.gate.resources | nindent 12 }}
+            {{- toYaml .Values.relay.resources | nindent 12 }}
           securityContext:
             {{- include "cliproxyapi.restricted" . | nindent 12 }}
           volumeMounts:
-            - {name: gate, mountPath: /usr/local/etc/haproxy, readOnly: true}
+            - {name: relay, mountPath: /usr/local/etc/haproxy, readOnly: true}
         - name: config-sync
           image: {{ .Values.haproxyImage }}
           imagePullPolicy: IfNotPresent
@@ -161,41 +158,6 @@ spec:
           volumeMounts:
             - {name: config-src, mountPath: /etc/cliproxy-src, readOnly: true}
             - {name: config, mountPath: /etc/cliproxy}
-        {{- if .Values.keeper.enabled }}
-        - name: keeper
-          image: {{ .Values.keeper.image }}
-          imagePullPolicy: IfNotPresent
-          command: ["bash", "/opt/keeper/keeper.sh"]
-          env:
-            - name: NAMESPACE
-              valueFrom:
-                fieldRef: {fieldPath: metadata.namespace}
-            - name: HOME
-              value: /tmp
-            - name: KEEPER_DEPLOYMENT
-              value: {{ $name }}
-            - name: KEEPER_REPOSITORY
-              value: {{ .Values.image.repository }}
-            - name: KEEPER_RELEASE_URL
-              value: https://api.github.com/repos/{{ .Values.keeper.githubRepository }}/releases/latest
-            - name: KEEPER_HEALTH_URL
-              value: http://127.0.0.1:{{ .Values.gate.port }}/v1/models
-          resources:
-            {{- toYaml .Values.keeper.resources | nindent 12 }}
-          # Group 0 reads the projected token (root:root 0440).
-          securityContext:
-            runAsUser: 65532
-            runAsGroup: 0
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: {drop: ["ALL"]}
-          volumeMounts:
-            - {name: keeper, mountPath: /opt/keeper, readOnly: true}
-            - {name: keeper-state, mountPath: /run/keeper}
-            - {name: keeper-tmp, mountPath: /tmp}
-            - {name: kube-api, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
-        {{- end }}
       volumes:
         - name: config-src
           secret:
@@ -210,9 +172,9 @@ spec:
         - name: auth
           persistentVolumeClaim:
             claimName: {{ .Values.auth.existingClaim | default (printf "%s-auth" $name) }}
-        - name: gate
+        - name: relay
           configMap:
-            name: {{ $name }}-gate
+            name: {{ $name }}-relay
         {{- if .Values.pool.enabled }}
         - name: pool
           persistentVolumeClaim:
@@ -230,30 +192,4 @@ spec:
             defaultMode: 0400
             items:
               - {key: {{ .Values.config.managementKey }}, path: management-key}
-        {{- end }}
-        {{- if .Values.keeper.enabled }}
-        - name: keeper
-          configMap:
-            name: {{ $name }}-keeper-script
-        - name: keeper-state
-          emptyDir:
-            sizeLimit: 1Mi
-        - name: keeper-tmp
-          emptyDir:
-            sizeLimit: 32Mi
-        - name: kube-api
-          projected:
-            defaultMode: 0440
-            sources:
-              - serviceAccountToken:
-                  path: token
-                  expirationSeconds: 3607
-              - configMap:
-                  name: kube-root-ca.crt
-                  items:
-                    - {key: ca.crt, path: ca.crt}
-              - downwardAPI:
-                  items:
-                    - path: namespace
-                      fieldRef: {fieldPath: metadata.namespace}
         {{- end }}

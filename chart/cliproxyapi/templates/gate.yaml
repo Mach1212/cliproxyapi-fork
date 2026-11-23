@@ -1,0 +1,152 @@
+{{- /*
+The gate's pod, apart from the proxy's (deployment.yaml), so that the port clients reach
+stays open while the proxy restarts.
+- gate: HAProxy, the only listener clients reach. HTTP/1 only; lets only /v1/ and /v1beta/
+  paths through after normalization; refuses any %-encoding; strips forwarded headers. It
+  passes a request to the relay in the proxy's pod, and holds it while that pod is replaced.
+  Its runtime API on 127.0.0.1:9999 and its second frontend on 127.0.0.1:8316 are the
+  keeper's.
+- keeper: follows the fork's releases. The only container with a token for the cluster.
+*/ -}}
+{{- $name := include "cliproxyapi.fullname" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-gate
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "cliproxyapi.gateSelector" . | nindent 6 }}
+  # Maybe a port of the node: the old pod has to be gone before the new one starts.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "cliproxyapi.gateSelector" . | nindent 8 }}
+      annotations:
+        # The gate and the keeper read these only when they start.
+        checksum/gate: {{ include "cliproxyapi.gate.cfg" . | sha256sum }}
+        {{- if .Values.keeper.enabled }}
+        checksum/keeper: {{ .Files.Get "files/keeper.sh" | sha256sum }}
+        {{- end }}
+    spec:
+      {{- if .Values.keeper.enabled }}
+      serviceAccountName: {{ $name }}-keeper
+      {{- end }}
+      # Only the keeper container gets a token (projected below).
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gate
+          image: {{ .Values.haproxyImage }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: api
+              containerPort: {{ .Values.gate.port }}
+              {{- if .Values.gate.hostPort }}
+              hostPort: {{ .Values.gate.hostPort }}
+              {{- end }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.gate.resources | nindent 12 }}
+          securityContext:
+            {{- include "cliproxyapi.restricted" . | nindent 12 }}
+          volumeMounts:
+            - {name: gate, mountPath: /usr/local/etc/haproxy, readOnly: true}
+        {{- if .Values.keeper.enabled }}
+        - name: keeper
+          image: {{ .Values.keeper.image }}
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/opt/keeper/keeper.sh"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef: {fieldPath: metadata.namespace}
+            - name: HOME
+              value: /tmp
+            - name: KEEPER_DEPLOYMENT
+              value: {{ $name }}
+            - name: KEEPER_REPOSITORY
+              value: {{ .Values.image.repository }}
+            - name: KEEPER_RELEASE_URL
+              value: https://api.github.com/repos/{{ .Values.keeper.githubRepository }}/releases/latest
+            # Through the gate, as a client.
+            - name: KEEPER_HEALTH_URL
+              value: http://127.0.0.1:{{ .Values.gate.port }}/v1/models
+            # Through the gate's loopback frontend, which a hold leaves open.
+            - name: KEEPER_PROXY_URL
+              value: http://127.0.0.1:8316/v1/models
+            - name: KEEPER_HOLD
+              value: {{ .Values.keeper.holdSeconds | quote }}
+            - name: KEEPER_START
+              value: {{ .Values.keeper.startSeconds | quote }}
+          resources:
+            {{- toYaml .Values.keeper.resources | nindent 12 }}
+          # Group 0 reads the projected token (root:root 0440).
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 0
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: keeper, mountPath: /opt/keeper, readOnly: true}
+            - {name: keeper-state, mountPath: /run/keeper}
+            - {name: keeper-tmp, mountPath: /tmp}
+            - {name: kube-api, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
+        {{- end }}
+      volumes:
+        - name: gate
+          configMap:
+            name: {{ $name }}-gate
+        {{- if .Values.keeper.enabled }}
+        - name: keeper
+          configMap:
+            name: {{ $name }}-keeper-script
+        - name: keeper-state
+          emptyDir:
+            sizeLimit: 1Mi
+        - name: keeper-tmp
+          emptyDir:
+            sizeLimit: 32Mi
+        - name: kube-api
+          projected:
+            defaultMode: 0440
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - {key: ca.crt, path: ca.crt}
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef: {fieldPath: metadata.namespace}
+        {{- end }}

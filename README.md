@@ -92,9 +92,17 @@ With the pool on:
 
 ## Deploying it
 
-[`chart/cliproxyapi`](chart/cliproxyapi) is a Helm chart for the proxy with the pool: the
-proxy on loopback, a gate in front of it that the keeper drains before the proxy restarts,
-and the keeper, which keeps the proxy on this fork's latest build.
+[`chart/cliproxyapi`](chart/cliproxyapi) is a Helm chart for the proxy with the pool, in two
+pods:
+
+- **the proxy's pod**: the proxy on loopback, and beside it the relay, the one listener the
+  gate reaches;
+- **the gate's pod**: the gate, the only listener clients reach, and the keeper, which keeps
+  the proxy on this fork's latest build.
+
+The gate is a pod of its own so that its port stays open while the proxy's pod restarts. A
+request that arrives meanwhile waits for the proxy instead of being refused: the gate and the
+relay each try their next hop about once a second, `gate.retries` times.
 
 ```sh
 helm upgrade --install cliproxyapi chart/cliproxyapi --namespace cliproxyapi -f my-values.yaml
@@ -117,8 +125,8 @@ Values worth setting:
 
 - `networkPolicy.clientCIDRs`: who reaches the gate. `networkPolicy.siteFrom`: the website's
   pods, which reach the site API. Nothing else gets in.
-- `gate.hostPort`: clients reach the gate at the pod's node, port 8317. Pin the pod to that
-  node with `affinity` or `nodeSelector`.
+- `gate.hostPort`: clients reach the gate at its pod's node, port 8317. Pin the pods to that
+  node with `affinity` or `nodeSelector`, which place both.
 - `auth.existingClaim`: the disk of signed-in accounts, when there is one already.
 
 The route from outside the cluster is yours to make; the chart has none. Send it to the gate
@@ -128,8 +136,24 @@ Things to know:
 
 - **Upgrading the chart leaves the proxy's image alone** once it runs a build of this fork:
   the keeper moves it, and an upgrade must not undo that. `image.force: true` sets it.
-- **An upgrade that changes the pod restarts it at once**, and cuts the requests in flight.
-  To spare them, drain the gate first the way the keeper does (`files/keeper.sh`, `drain_on`).
+- **A new build goes in without a refused or a cut request.** The keeper waits for a moment
+  when no client connection is open. Nobody waits for that moment, so under steady load a
+  build waits. Then the keeper holds the gate, sets the image, and opens the gate once the
+  new proxy answers: a request that arrives meanwhile waits those seconds.
+- **A build that does not answer, or fails its check, is taken out and skipped.** The
+  Deployment's `cliproxy/skip` annotation names it, and the keeper leaves that release alone
+  until a newer one is out. Remove the annotation to let the keeper try it again; set it to
+  keep the keeper from a release.
+- **An upgrade that changes the proxy's pod restarts it at once**, and cuts the answers in
+  flight; requests that arrive meanwhile wait at the gate. To spare the answers, do it at a
+  moment without a client connection, the way the keeper does (`files/keeper.sh`, `quiet`).
+- **An upgrade that changes the gate's pod** (the gate's configuration, the keeper's script)
+  restarts it at once too, and with a port of the node that port is closed for a few
+  seconds. Do it when nobody is working.
+- **The relay's port is for the gate's pod alone**, and the chart's NetworkPolicy is what
+  closes it to other pods. On a cluster that does not enforce NetworkPolicy every pod
+  reaches it; the relay then still lets only `/v1/` and `/v1beta/` paths through, as the
+  gate does.
 - **The two disks stay** when the release is removed (`helm.sh/resource-policy: keep`).
 - **The keeper's admission policy** is a cluster-wide object named after the namespace and
   the release. It lists the pod fields of Kubernetes v1.35.

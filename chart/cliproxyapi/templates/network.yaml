@@ -1,5 +1,22 @@
 {{- $name := include "cliproxyapi.fullname" . -}}
+# The relay, for the gate alone. It names the proxy's pod before the proxy is ready as well:
+# the relay holds a request until the proxy takes it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-relay
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "cliproxyapi.selector" . | nindent 4 }}
+  publishNotReadyAddresses: true
+  ports:
+    - name: relay
+      port: {{ .Values.relay.port }}
+      targetPort: relay
 {{- if .Values.pool.enabled }}
+---
 # The site API, for the website.
 apiVersion: v1
 kind: Service
@@ -14,12 +31,39 @@ spec:
     - name: site-api
       port: {{ .Values.pool.service.port }}
       targetPort: site-api
----
 {{- end }}
 {{- if .Values.networkPolicy.enabled }}
-# Who may connect to the pod. A client that reaches the gate through the node's port
+---
+# Who may connect to the gate's pod. A client that reaches the gate through the node's port
 # arrives with its own address when it is on the node's network, and with its node's
 # address when it is a pod of another node.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-gate-ingress
+  labels:
+    {{- include "cliproxyapi.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cliproxyapi.gateSelector" . | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    {{- with .Values.networkPolicy.clientCIDRs }}
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $.Values.gate.port }}
+    {{- else }}
+    []
+    {{- end }}
+---
+# Who may connect to the proxy's pod: the gate's pod to the relay, and the website to the
+# site API.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -32,16 +76,13 @@ spec:
       {{- include "cliproxyapi.selector" . | nindent 6 }}
   policyTypes: ["Ingress"]
   ingress:
-    {{- with .Values.networkPolicy.clientCIDRs }}
     - from:
-        {{- range . }}
-        - ipBlock:
-            cidr: {{ . }}
-        {{- end }}
+        - podSelector:
+            matchLabels:
+              {{- include "cliproxyapi.gateSelector" . | nindent 14 }}
       ports:
         - protocol: TCP
-          port: {{ $.Values.gate.port }}
-    {{- end }}
+          port: {{ .Values.relay.port }}
     {{- if and .Values.pool.enabled .Values.networkPolicy.siteFrom }}
     - from:
         {{- range .Values.networkPolicy.siteFrom }}
@@ -55,8 +96,5 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.pool.service.port }}
-    {{- end }}
-    {{- if not (or .Values.networkPolicy.clientCIDRs (and .Values.pool.enabled .Values.networkPolicy.siteFrom)) }}
-    []
     {{- end }}
 {{- end }}

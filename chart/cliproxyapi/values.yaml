@@ -39,12 +39,24 @@ auth:
   # Empty: the cluster's default storage class.
   storageClassName: ""
 
-# The gate: HAProxy, the only listener clients reach. It lets only /v1/ and /v1beta/ paths
-# through, and the keeper drains it before the proxy restarts.
+# The gate: HAProxy in a pod of its own, the only listener clients reach. It lets only /v1/
+# and /v1beta/ paths through. Its port stays open while the proxy's pod restarts: a request
+# that arrives meanwhile waits.
 gate:
   port: 8317
   # The port on the node, for clients that reach the node's own address. 0 for none.
   hostPort: 8317
+  # How often the gate tries the proxy's pod when it takes no connection, about once a
+  # second, before the client gets a 503. The relay tries the proxy as often.
+  retries: 30
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {memory: 256Mi}
+
+# The relay: HAProxy in the proxy's pod, the listener the gate reaches. It passes a request
+# to the proxy on loopback, under the gate's rules once more.
+relay:
+  port: 8319
   resources:
     requests: {cpu: 10m, memory: 32Mi}
     limits: {memory: 256Mi}
@@ -66,8 +78,8 @@ pool:
     size: 1Gi
     storageClassName: ""
 
-# Who may connect. Everything else is refused, the proxy's own port and the gate's runtime
-# port included (both listen on loopback as well).
+# Who may connect. Everything else is refused: the relay to all but the gate's pod, and the
+# proxy's own port and the gate's runtime port to everyone (both listen on loopback as well).
 networkPolicy:
   enabled: true
   # Addresses that reach the gate, for example the tailnet's range.
@@ -75,12 +87,21 @@ networkPolicy:
   # Pods that reach the site API: [{namespace: default, podLabels: {app: website}}].
   siteFrom: []
 
-# The keeper: keeps the proxy on the fork's latest build, draining the gate first.
+# The keeper, beside the gate: keeps the proxy on the fork's latest build. It sets a new
+# image at a moment when no client connection is open, and holds the gate while the proxy's
+# pod is replaced: a request that arrives meanwhile waits, none is refused.
 keeper:
   enabled: true
   image: alpine/k8s:1.35.8@sha256:aaeed1de1399aa816535d376c7d5c9bea905892301649ffaee0905397c7d4956
   # The fork's repository on GitHub, whose latest release names the image.
   githubRepository: Mach1212/cliproxyapi-fork
+  # How long a new build has to answer once its image is set. When it does not, the keeper
+  # goes back to the previous image at once, the gate still held.
+  startSeconds: 60
+  # When a build that fails its check is taken out: how long new requests may wait at the
+  # gate for the open answers to finish. When answers still run after that, the gate opens
+  # again and the keeper tries again five minutes later.
+  holdSeconds: 90
   # An admission policy that holds the keeper to its one job: its account may change the
   # proxy's image, to a build of the fork, and the cliproxy/* annotations. Nothing else.
   # It is a cluster-wide object, checked against Kubernetes v1.35's pod fields.
@@ -90,10 +111,11 @@ keeper:
     requests: {cpu: 10m, memory: 32Mi}
     limits: {memory: 256Mi}
 
-# The image of the small helpers (the gate, and the copy of the configuration).
+# The image of the small helpers (the gate, the relay, and the copy of the configuration).
 haproxyImage: haproxy:3.2.25-alpine@sha256:5d97434a423c2533cfeb42874d45cf6d69a840b60334582dfbfd5008e94c80be
 
-# The pod has one disk and may hold a port of its node, so it runs once, on one node.
+# Both pods run once, each on one node: the proxy's has the disks, and the gate's may hold a
+# port of its node. These place both.
 nodeSelector: {}
 affinity: {}
 tolerations: []
