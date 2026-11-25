@@ -18,3 +18,4 @@ Each line is a build of an upstream release with the pool: its release here, and
 - 2026-11-21 [v8.1.0-pool.1](https://github.com/Mach1212/cliproxyapi-fork/releases/tag/v8.1.0-pool.1) `ghcr.io/mach1212/cliproxyapi-fork:v8.1.0-pool.1@sha256:e33b023883b1a8a2ec986ad3334453b561bea1d8ff7f5bbc981454c5d1f1508c`
 - 2026-11-22 [v8.1.1-pool.1](https://github.com/Mach1212/cliproxyapi-fork/releases/tag/v8.1.1-pool.1) `ghcr.io/mach1212/cliproxyapi-fork:v8.1.1-pool.1@sha256:39c5ce97aa74a59442b21e916316c1037925396a638138a812d28ad8edb7c4db`
 - 2026-11-23 [v8.1.2-pool.1](https://github.com/Mach1212/cliproxyapi-fork/releases/tag/v8.1.2-pool.1) `ghcr.io/mach1212/cliproxyapi-fork:v8.1.2-pool.1@sha256:9c32fcb67cf11cb8b8c4692222cca88110ddbec491d370c8ee80dce18b55aba5`
+- 2026-11-25 [v8.1.3-pool.1](https://github.com/Mach1212/cliproxyapi-fork/releases/tag/v8.1.3-pool.1) `ghcr.io/mach1212/cliproxyapi-fork:v8.1.3-pool.1@sha256:71d03628aef7afcca8834ee79da4bf2bcc5081259b87f0e7e11602dc06ce9fc5`
