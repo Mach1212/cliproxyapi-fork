@@ -106,6 +106,43 @@ func (f *fakeAnthropic) count() int {
 	return len(f.calls)
 }
 
+// proxyStarted is the line upstream prints once it has finished starting. It answers requests
+// before that, and the last thing it does before that is to load its accounts a second time,
+// which forgets the weekly figures that their answers have taught the pool.
+const proxyStarted = "file watcher started for config and auth directory changes"
+
+// proxyOutput is what the proxy prints, read by the test while the proxy writes it. started is
+// closed once the proxy has printed proxyStarted.
+type proxyOutput struct {
+	mu      sync.Mutex
+	text    bytes.Buffer
+	started chan struct{}
+}
+
+func newProxyOutput() *proxyOutput {
+	return &proxyOutput{started: make(chan struct{})}
+}
+
+func (o *proxyOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	n, err := o.text.Write(p)
+	select {
+	case <-o.started:
+	default:
+		if bytes.Contains(o.text.Bytes(), []byte(proxyStarted)) {
+			close(o.started)
+		}
+	}
+	return n, err
+}
+
+func (o *proxyOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.text.String()
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -246,10 +283,10 @@ api-keys:
 		}
 	}
 
-	var output bytes.Buffer
+	output := newProxyOutput()
 	server := exec.Command(binary, "-config", configPath, "-local-model")
 	server.Dir = dir
-	server.Stdout, server.Stderr = &output, &output
+	server.Stdout, server.Stderr = output, output
 	server.Env = append(os.Environ(),
 		"POOL_STATE_DIR="+filepath.Join(dir, "pool"),
 		"POOL_LISTEN=127.0.0.1:"+strconv.Itoa(sitePort),
@@ -298,6 +335,14 @@ api-keys:
 			t.Fatalf("the proxy did not come up:\n%s", output.String())
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	// Answering is not having finished starting: a request before proxyStarted can teach the pool
+	// figures that upstream's last load of the accounts then forgets, and the rest of the run
+	// would go to whichever account comes first by id.
+	select {
+	case <-output.started:
+	case <-time.After(time.Until(deadline)):
+		t.Fatalf("the proxy did not finish starting:\n%s", output.String())
 	}
 
 	// The two accounts, by the key each sends upstream.
